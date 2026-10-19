@@ -36,7 +36,7 @@ def ck(feature):
 
 # Values a new lookup resets to. f_* are the unit form's fields, s_* its dropdowns, x_* its checkboxes.
 FORM_DEFAULTS = {"f_beds": None, "f_baths": None, "f_sqft": None, "f_floor": None, "f_year": None, "f_zip": "",
-                 "f_lat": None, "f_lon": None, "f_laundry": fa.UNKNOWN,
+                 "f_lat": None, "f_lon": None, "f_laundry": fa.UNKNOWN, "f_unticked_no": False,
                  **{"s_" + k: fa.UNKNOWN for k in fa.SELECTS}, **{ck(f): False for f in CHECKS}}
 ss = st.session_state
 for k, v in {"results": [], "cands": [], "units": [], "details": None, "summary": None, "amen_names": [],
@@ -120,6 +120,7 @@ def load_property(client, listing_key, search_result=None):
     for f in CHECKS:
         ss[ck(f)] = f in advertised
     ss[ck(DOORMAN)] = bool(flags["doorman_concierge"])
+    ss.f_unticked_no = bool(names)       # a listing's amenity list says what the building lacks
     ss.load_id += 1
     typed = [i for i, u in enumerate(ss.units) if sf_address.same_unit(ss.typed_unit, u.get("unit"))]
     ss.unit_idx = typed[0] if typed else (0 if ss.units else -1)
@@ -362,8 +363,14 @@ with st.form("unit_form"):
     select(c1, "pets")
     select(c2, "utilities")
     select(c3, "lease_term")
+    c1, _, _ = st.columns(3)
+    select(c1, "view")
 
     st.markdown("**Unit features**")
+    st.toggle("Unticked means the unit doesn't have it", key="f_unticked_no",
+              help="On: a missing feature that most training buildings have lowers the estimate a little. "
+                   "Off: unticked boxes are treated as unknown. Turned on automatically when the listing "
+                   "includes an amenity list.")
     checkboxes(fa.UNIT_FEATURES)
     st.markdown("**Building amenities**")
     checkboxes([DOORMAN] + fa.BUILDING_FEATURES)
@@ -393,6 +400,7 @@ def run_estimate():
     choices = {k: ss["s_" + k] for k in fa.SELECTS}
     choices["floor"] = ss.f_floor
     choices["features"] = {f for f in fa.UNIT_FEATURES + fa.BUILDING_FEATURES if ss[ck(f)]}
+    choices["unticked_means_no"] = ss.f_unticked_no
     adj = fa.adjust(model["estimate"], choices)
     i = ss.unit_idx
     listed = ss.units[i].get("rent") if ss.details is not None and 0 <= i < len(ss.units) else None
@@ -427,12 +435,20 @@ else:
     money = lambda x, signed=False: ("{}${:,.0f}".format(("+" if x >= 0 else "-") if signed else "", abs(x)))
     rows = [{"Factor": "Model estimate", "Amount": money(model["estimate"]),
              "Why": "Size, location, laundry and doorman, fit on SF listings. " + model["reliability"][:1].upper() + model["reliability"][1:] + "."}]
+    lacking = [r for r in adj["rows"] if r["detail"].startswith("Doesn't have it")]
     for r in adj["rows"]:
+        if r in lacking:
+            continue
         pct = " ({:+.1f}%)".format(r["value"]) if r["unit"] == "pct" else ""
         rows.append({"Factor": r["factor"], "Amount": money(r["dollars"], signed=True),
                      "Why": "{}{}. {} Confidence: {}.".format(r["detail"], pct, r["note"], r["confidence"])})
+    if lacking:
+        rows.append({"Factor": "Missing common features", "Amount": money(sum(r["dollars"] for r in lacking), signed=True),
+                     "Why": "Features many training buildings advertise, scaled by how common each is: " + "; ".join(
+                         "{} {}".format(r["factor"].lower(), money(r["dollars"], signed=True)) for r in lacking) + "."})
     rows.append({"Factor": "Estimated rent", "Amount": money(est), "Why": "Model estimate plus adjustments."})
-    st.table(pd.DataFrame(rows).set_index("Factor"))
+    # Table cells are markdown too: escape "$" so pairs of dollar amounts don't render as math.
+    st.table(pd.DataFrame(rows).set_index("Factor").map(lambda t: t.replace("$", "\\$")))
     if not adj["rows"]:
         st.caption("No feature adjustments: every feature is Unknown, unchecked, or the same as the typical "
                    "building the model was trained on.")
@@ -444,9 +460,11 @@ else:
         with st.expander("Sources for the feature adjustments"):
             for src in sources.values():
                 title = "[{}]({})".format(src["title"], src["url"]) if src.get("url") else src["title"]
-                st.markdown("- {}, {} ({})".format(src["name"], title, src["year"]))
+                st.markdown("- {}, {} ({})".format(src["name"], title, src["year"] or "undated"))
             st.caption("Adjustments are sized relative to the typical training building: having a feature most "
-                       "training buildings advertise adds less, and lacking it subtracts a little.")
+                       "training buildings advertise adds less, and lacking it subtracts a little. Most sources are "
+                       "listing comparisons or renter surveys, checked against search-engine extracts rather than "
+                       "full documents; treat low-confidence adjustments as rough.")
     if model["warnings"]:
         st.warning("\n".join("- " + w for w in model["warnings"]))
 
