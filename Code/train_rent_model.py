@@ -2,7 +2,7 @@
 """Fit the SF rent regression and write rent_model.py (the single file the app imports).
 
 Usage:
-    pip install pandas numpy statsmodels openpyxl
+    pip install pandas numpy statsmodels scikit-learn openpyxl
     python train_rent_model.py san_francisco_rentals_by_neighborhood.xlsx
     python train_rent_model.py listings.csv --out rent_model.py
 
@@ -18,10 +18,21 @@ Two kinds of input are recognised automatically:
      (laundry_reviewed, parking_reviewed, outdoor_space_reviewed, ...) and a
      comp_use column. Rows marked "Exclude" are dropped. Each amenity is coded
      yes / no / unknown (unknown is never treated as "no"). Because such a file
-     is small, the script limits the model to n/10 predictors chosen by
-     leave-one-out error, estimates an amenity only if at least 5 comps have it
-     and 5 do not, and writes a rent_model.py that carries wide-interval
-     warnings. Everything below describes input type 1.
+     is small, the script fits a LASSO (L1-penalized regression on log rent;
+     the penalty is chosen by leave-one-out error and weak predictors are set
+     to exactly zero). Pass --method subset for the older best-subset OLS
+     (n/10 predictors chosen by leave-one-out error). Either way an amenity is
+     estimated only if at least 5 comps have it and 5 do not, and the output
+     rent_model.py carries wide-interval warnings. Needs scikit-learn.
+
+  3. A RealtyAPI training file with one row per available unit (recognised by
+     the columns rent, beds, baths, sqft, zip_code, amenities, listing_key;
+     latitude, longitude and weight are used when present). Fits a lasso on
+     log rent with beds, baths, log(sqft) and distance to downtown left
+     unpenalized and zip effects and building-level amenities penalized. The
+     penalty comes from cross-validation that holds out whole buildings
+     (units in one building are not independent), and the reported error is
+     measured the same way, re-choosing the penalty inside every fold. Everything from here on describes input type 1.
 
 What it does:
   1. Cleans the listings (rules printed at run time and saved in the output file).
@@ -456,6 +467,122 @@ def _median_loo(d):
     return float(e.mean()), float((e / d["rent"].values).mean() * 100)
 
 
+# ---- lasso (default for comps files) ---------------------------------------
+N_BOOT = 300  # bootstrap resamples for the lasso intervals / selection frequency
+
+
+def _lasso_X(df, cands, unk, means):
+    return _comp_design(df, cands, unk, means).drop(columns="const")
+
+
+def _lasso_fit(X, y, alpha=None):
+    """Lasso on standardized predictors; returns (const, coef Series on the original
+    scale, alpha). If alpha is None it is chosen by leave-one-out cross-validation."""
+    from sklearn.linear_model import Lasso, LassoCV
+    from sklearn.model_selection import LeaveOneOut
+    mu, sd = X.mean(), X.std(ddof=0).replace(0, 1.0)
+    Z = ((X - mu) / sd).values
+    if alpha is None:
+        yc = y - y.mean()
+        amax = max(float(np.max(np.abs(Z.T @ yc))) / len(y), 1e-6)  # smallest alpha that zeroes everything
+        grid = np.geomspace(amax, amax * 1e-3, 60)
+        alpha = float(LassoCV(alphas=grid, cv=LeaveOneOut(), max_iter=100000).fit(Z, y).alpha_)
+    m = Lasso(alpha=alpha, max_iter=100000).fit(Z, y)
+    coef = pd.Series(m.coef_ / sd.values, index=X.columns)
+    const = float(m.intercept_ - np.dot(coef.values, mu.values))
+    return const, coef, alpha
+
+
+def _lasso_loo(d, cands, unk, means):
+    """Honest leave-one-out: alpha is re-chosen inside every fold, so the error
+    includes the cost of the selection step."""
+    X, y = _lasso_X(d, cands, unk, means), np.log(d["rent"].values)
+    res_log, abs_err, ape = [], [], []
+    for i in range(len(d)):
+        tr = np.arange(len(d)) != i
+        const, coef, _ = _lasso_fit(X[tr], y[tr])
+        pl = const + float(X.iloc[i].values @ coef.values)
+        smear = float(np.mean(np.exp(y[tr] - (const + X[tr].values @ coef.values))))
+        res_log.append(y[i] - pl)
+        abs_err.append(abs(math.exp(pl) * smear - math.exp(y[i])))
+        ape.append(abs_err[-1] / math.exp(y[i]))
+    return float(np.mean(abs_err)), float(np.mean(ape) * 100), np.array(res_log)
+
+
+def _fit_comps_lasso(d, steps, raw, cands, unk, means, screen, source_label):
+    n = len(d)
+    X, y = _lasso_X(d, cands, unk, means), np.log(d["rent"].values)
+    base_mae, base_mape = _median_loo(d)
+    const, coef, alpha = _lasso_fit(X, y)
+    mae, mape, res = _lasso_loo(d, cands, unk, means)
+
+    rng = np.random.default_rng(0)
+    boot = np.zeros((N_BOOT, X.shape[1]))
+    for b in range(N_BOOT):
+        idx = rng.integers(0, n, n)
+        boot[b] = _lasso_fit(X.iloc[idx], y[idx], alpha)[1].values
+    lo, hi = np.percentile(boot, [2.5, 97.5], axis=0)
+    freq = (boot != 0).mean(axis=0)
+
+    kept = [c for c in X.columns if coef[c] != 0]
+    fitted = const + X.values @ coef.values
+    resid = y - fitted
+    coefs = {c: {"coef": round(float(coef[c]), 5),
+                 "ci95": [round(float(lo[j]), 5), round(float(hi[j]), 5)],
+                 "selected_share": round(float(freq[j]), 3)}
+             for j, c in enumerate(X.columns) if c in kept}
+    names = [c for c in kept if not c.endswith("_unknown")]
+    q = {k: round(float(np.quantile(res, v)), 4)
+         for k, v in {"p10": .1, "p25": .25, "p75": .75, "p90": .9}.items()}
+    shares = {a: round(float(d[a].mean()), 3) for a in names if a in COMP_AMENITIES}
+    improvement = (base_mae - mae) / base_mae * 100
+    beats = improvement >= 10
+    dropped = [c for c in X.columns if c not in kept and not c.endswith("_unknown")]
+    r2 = 1 - float(np.sum(resid ** 2) / np.sum((y - y.mean()) ** 2))
+
+    only_beds = sorted(d["beds"].unique())
+    caveats = [f"Only {n} comps: every coefficient has a wide interval (bootstrap ci95; approximate for a lasso).",
+               "Lasso shrinks coefficients toward zero, so the effects are deliberately smaller than "
+               "an unpenalized fit would give; the penalty is chosen by leave-one-out error.",
+               "Amenity effects are associations. Units with an amenity also tend to be newer, "
+               "larger or better located, so they overstate what adding the amenity would earn.",
+               "No location effect (too few comps per zip); the estimate reflects the comp set's average location."]
+    if len(only_beds) == 1:
+        caveats.insert(1, f"All comps are {only_beds[0]:g}-bedroom, so the bedroom effect cannot be "
+                          f"estimated and the model is valid for {only_beds[0]:g}-bedroom units only.")
+    if d["sqft"].notna().sum() and "log_sqft" not in cands:
+        caveats.append(f"Square footage is not used: missing for {int(d['sqft'].isna().sum())} of {n} comps.")
+    skipped = [f"{a} ({r['reason']})" for a, r in screen.items() if not r["estimable"]]
+    if skipped:
+        caveats.append("Amenities that could not be estimated: " + "; ".join(skipped) + ".")
+    reliability = (f"low: fit on {n} comps; typical out-of-sample error about {mape:.0f}% "
+                   f"(plain median of the comps: {base_mape:.0f}%)")
+    if not beats:
+        reliability += "; does NOT clearly beat the plain median"
+
+    info = dict(trained=str(datetime.date.today()), source=source_label, method="lasso",
+                alpha_standardized=round(alpha, 5), n_raw=int(len(raw)), n_used=int(n),
+                cleaning=[f"dropped {name}: {c} rows" for name, c in steps],
+                predictors=names, set_to_zero_by_lasso=dropped, r2_in_sample=round(r2, 3),
+                leave_one_out=dict(model_mae_usd=round(mae), model_mape_pct=round(mape, 1),
+                                   baseline="median rent of the other comps",
+                                   baseline_mae_usd=round(base_mae), baseline_mape_pct=round(base_mape, 1),
+                                   beats_baseline=bool(beats)),
+                reliability=reliability, caveats=caveats)
+    params = dict(
+        info=info, const=round(const, 5), coefs=coefs,
+        amenity_share_yes=shares, means={k: round(v, 5) for k, v in means.items()},
+        smearing=round(float(np.mean(np.exp(resid))), 5), resid_q=q,
+        support=dict(beds=[float(d["beds"].min()), float(d["beds"].max())],
+                     baths=[float(d["baths"].min()), float(d["baths"].max())],
+                     zips=sorted(d["zip_code"].unique().tolist()),
+                     rent=[float(d["rent"].min()), float(d["rent"].max())]),
+        screen=screen,
+        _report=dict(table=None, alpha=alpha, base=(base_mae, base_mape), budget=None,
+                     improvement=improvement, candidates=list(X.columns)))
+    return params, steps
+
+
 def _amenity_screen(d, control_baths):
     """Per amenity: how many yes / no / unknown, and (if enough of both) its effect
     on its own, controlling for bathrooms."""
@@ -483,7 +610,7 @@ def _amenity_screen(d, control_baths):
     return rows
 
 
-def fit_comps(raw, source_label):
+def fit_comps(raw, source_label, method="lasso"):
     d, steps = clean_comps(raw)
     n = len(d)
     if n < 15:
@@ -502,6 +629,9 @@ def fit_comps(raw, source_label):
     unk = {a for a in COMP_AMENITIES if d[a].isna().any()}
     means = {"beds": float(d["beds"].mean()), "baths": float(d["baths"].mean()),
              "log_sqft": float(np.log(d["sqft"]).mean()) if d["sqft"].notna().any() else 0.0}
+
+    if method == "lasso":
+        return _fit_comps_lasso(d, steps, raw, cands, unk, means, screen, source_label)
 
     budget = max(1, n // 10)
     base_mae, base_mape = _median_loo(d)
@@ -547,7 +677,7 @@ def fit_comps(raw, source_label):
     if not beats:
         reliability += "; does NOT clearly beat the plain median"
 
-    info = dict(trained=str(datetime.date.today()), source=source_label,
+    info = dict(trained=str(datetime.date.today()), source=source_label, method="best-subset OLS",
                 n_raw=int(len(raw)), n_used=int(n),
                 cleaning=[f"dropped {name}: {c} rows" for name, c in steps],
                 predictors=[p for p in best], r2_in_sample=round(float(m.rsquared), 3),
@@ -588,8 +718,10 @@ READ THIS BEFORE USING THE NUMBERS
   The vacancy curve (predict_vacancy) is still a placeholder.
 
 The model is log(asking monthly rent) = const + sum(coef * variable), and
-rent = exp(that) * smearing. For a yes/no variable, exp(coef) - 1 is the percent
-rent difference. The "_unknown" terms only absorb listings whose status was not
+rent = exp(that) * smearing. MODEL_INFO["method"] says how the coefficients were
+fit: "lasso" shrinks weak coefficients toward zero (or exactly to zero, see
+MODEL_INFO["set_to_zero_by_lasso"]) so effects are conservative. For a yes/no
+variable, exp(coef) - 1 is the percent rent difference. The "_unknown" terms only absorb listings whose status was not
 reported; they are never used for pricing.
 """
 import math
@@ -735,32 +867,538 @@ def report_comps(p, steps):
             print(f"{head}   {s['effect_pct']:+.0f}%  95% CI [{s['ci95_pct'][0]:+.0f}%, {s['ci95_pct'][1]:+.0f}%]  p={s['p']:.3f}")
         else:
             print(f"{head}   not estimable: {s['reason']}")
-    print(f"\nleave-one-out error of candidate models (at most {r['budget']} predictors; "
-          f"plain median of the other comps: ${r['base'][0]:,.0f}):")
-    for mae, mape, preds in r["table"][:6]:
-        print(f"  ${mae:>6,.0f} ({mape:4.1f}%)  {' + '.join(preds)}")
+    if r["table"] is None:
+        print(f"\nlasso on {', '.join(r['candidates'])}")
+        print(f"penalty (standardized alpha) {r['alpha']:.4f}, chosen by leave-one-out cross-validation")
+        print(f"set to zero by the lasso: {', '.join(i['set_to_zero_by_lasso']) or 'none'}")
+    else:
+        print(f"\nleave-one-out error of candidate models (at most {r['budget']} predictors; "
+              f"plain median of the other comps: ${r['base'][0]:,.0f}):")
+        for mae, mape, preds in r["table"][:6]:
+            print(f"  ${mae:>6,.0f} ({mape:4.1f}%)  {' + '.join(preds)}")
     lo = i["leave_one_out"]
-    print(f"\nselected: {' + '.join(i['predictors'])}   in-sample R2 {i['r2_in_sample']}")
+    print(f"\nselected: {' + '.join(i['predictors']) or '(nothing: constant only)'}   in-sample R2 {i['r2_in_sample']}")
     print(f"leave-one-out MAE ${lo['model_mae_usd']:,} ({lo['model_mape_pct']}%) vs "
           f"${lo['baseline_mae_usd']:,} ({lo['baseline_mape_pct']}%) for the plain median"
           f"{'' if lo['beats_baseline'] else '   <-- does not clearly beat the median'}")
     for k, v in p["coefs"].items():
         eff = f"{(math.exp(v['coef']) - 1) * 100:+.0f}%" if k != "log_sqft" else "elasticity"
-        print(f"  {k:<24} coef {v['coef']:+.3f} ({eff:>10})  95% CI [{v['ci95'][0]:+.2f}, {v['ci95'][1]:+.2f}]  p={v['p']:.3f}")
+        tail = (f"p={v['p']:.3f}" if "p" in v else f"kept in {v['selected_share']:.0%} of bootstrap fits")
+        print(f"  {k:<24} coef {v['coef']:+.3f} ({eff:>10})  95% CI [{v['ci95'][0]:+.2f}, {v['ci95'][1]:+.2f}]  {tail}")
     print("\ncaveats:")
     for c in i["caveats"]:
         print("  -", c)
+
+
+# =====================================================================================
+# Input type 3: RealtyAPI training file, one row per available unit
+# (columns rent, beds, baths, sqft, zip_code, latitude, longitude, amenities,
+#  listing_key and optionally weight). Lasso with cross-validation that holds out
+# whole buildings.
+# =====================================================================================
+UNITS_REQUIRED = {"rent", "beds", "baths", "sqft", "zip_code", "amenities", "listing_key"}
+MIN_SQFT = 200            # smaller rows are shared-living rooms / non-standard units
+MIN_ZIP_BUILDINGS = 3     # zips with fewer buildings are pooled into "zip_other"
+MIN_AMEN_BUILDINGS = 5    # an amenity needs this many buildings with it and without it
+CBD_LAT, CBD_LON = 37.788, -122.407   # Union Square, for the distance-to-downtown variable
+CORE = ["beds", "baths", "log_sqft", "dist_km"]   # never penalized by the lasso
+RATIOS = np.geomspace(1.0, 1e-3, 60)  # penalty as a fraction of the smallest penalty that zeroes everything
+CV_REPEATS = 3            # repeats of the outer (error-measuring) cross-validation
+SELECT_REPEATS = 20       # repeats of 10-fold CV used to choose the final penalty (the curve is flat and noisy)
+INNER_REPEATS = 2         # repeats of 5-fold CV for the penalty inside each outer fold
+AMENITY_GROUPS = {
+    "in_unit_laundry": ["Washer Dryer"], "shared_laundry": ["Laundry Facilities"],
+    "parking": ["Parking", "Garage Parking"], "balcony_patio": ["Balcony", "Patio"],
+    "doorman_concierge": ["Doorman", "Concierge"],
+}
+
+
+def _dist_km(lat, lon):
+    return np.hypot((np.asarray(lat, float) - CBD_LAT) * 111.0,
+                    (np.asarray(lon, float) - CBD_LON) * 111.0 * math.cos(math.radians(37.8)))
+
+
+def clean_units(raw):
+    d = raw.copy()
+    steps = []
+    for c in ("rent", "beds", "baths", "sqft"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    def step(name, keep):
+        nonlocal d
+        before = len(d)
+        d = d[keep(d)].copy()
+        steps.append((name, before - len(d)))
+
+    if "unit_key" in d:
+        step("duplicate unit (same unit_key)",
+             lambda x: x["unit_key"].isna() | ~x.duplicated(["listing_key", "unit_key"], keep="first"))
+    d["zip_code"] = d["zip_code"].astype(str).str.extract(r"(\d{5})", expand=False)
+    step("missing rent, bedrooms, bathrooms or zip code",
+         lambda x: x.rent.notna() & x.baths.notna() & x.beds.notna() & x.zip_code.notna())
+    step("missing square footage (a size-controlled model cannot use them)", lambda x: x.sqft.notna())
+    step(f"under {MIN_SQFT} sq ft (shared-living rooms and other non-standard units)", lambda x: x.sqft >= MIN_SQFT)
+    d = d.reset_index(drop=True)
+    w = pd.to_numeric(d["weight"], errors="coerce") if "weight" in d else pd.Series(np.nan, index=d.index)
+    w = w.fillna(1.0 / d.groupby("listing_key")["rent"].transform("size"))
+    d["w"] = w / w.groupby(d["listing_key"]).transform("sum")   # every building counts as 1 in total
+    return d, steps
+
+
+def _units_design(d):
+    """Core variables, penalized variables (zip effects + amenities) and the metadata
+    the prediction function needs."""
+    toks = d["amenities"].fillna("").map(lambda s: {x.strip() for x in str(s).split(";") if x.strip()})
+    grouped = {t for v in AMENITY_GROUPS.values() for t in v}
+    A = {}
+    for k, v in AMENITY_GROUPS.items():
+        A[k] = toks.map(lambda s, v=v: float(bool(s & set(v))))
+    for t in sorted({t for s in toks for t in s} - grouped):
+        A[t.lower().replace(" ", "_")] = toks.map(lambda s, t=t: float(t in s))
+    A = pd.DataFrame(A, index=d.index)
+    bld = d["listing_key"]
+    keep, skipped = [], []
+    for c in A:
+        per = A[c].groupby(bld).max()
+        n_yes, n_no = int((per == 1).sum()), int((per == 0).sum())
+        if n_yes >= MIN_AMEN_BUILDINGS and n_no >= MIN_AMEN_BUILDINGS:
+            keep.append(c)
+        else:
+            skipped.append(f"{c} ({n_yes} buildings with, {n_no} without)")
+    A = A[keep]
+
+    zb = d.groupby("zip_code")["listing_key"].nunique()
+    zgroups = sorted(str(z) for z in zb[zb >= MIN_ZIP_BUILDINGS].index)
+    Z = pd.DataFrame({f"zip_{z}": (d["zip_code"] == z).astype(float) for z in zgroups}, index=d.index)
+    Z["zip_other"] = (~d["zip_code"].isin(zgroups)).astype(float)
+    if Z["zip_other"].sum() == 0:
+        Z = Z.drop(columns="zip_other")
+
+    lat, lon = d["latitude"].astype(float), d["longitude"].astype(float)
+    dist = pd.Series(_dist_km(lat, lon), index=d.index)
+    dist = dist.fillna(dist.groupby(d["zip_code"]).transform("mean")).fillna(dist.mean())
+    core = pd.DataFrame({"beds": d["beds"], "baths": d["baths"], "log_sqft": np.log(d["sqft"]),
+                         "dist_km": dist})
+    pen = pd.concat([Z, A], axis=1)
+    per_bld = A.groupby(bld).max()
+    meta = dict(amenities=list(A.columns), skipped=skipped, zip_groups=zgroups,
+                shares={c: float(per_bld[c].mean()) for c in A.columns},
+                zip_dist={str(z): round(float(v), 3) for z, v in dist.groupby(d["zip_code"]).mean().items()},
+                beds_counts={str(int(b)): int(n) for b, n in d["beds"].round().value_counts().sort_index().items()},
+                n_buildings=int(bld.nunique()))
+    return core, pen, meta
+
+
+def _u_path(C, P, y, w, ratios):
+    """Lasso path with `C` (core, unpenalized) and `P` (penalized) columns on log rent `y`.
+    Unpenalized columns are handled exactly by projecting them out of y and P first
+    (Frisch-Waugh), the lasso runs on the leftovers, and the core coefficients are then
+    recovered. Returns beta (1 + n_core, n_penalties) and gamma (n_pen, n_penalties)."""
+    from sklearn.linear_model import enet_path
+    sw = np.sqrt(w / w.mean())
+    Cc = np.column_stack([np.ones(len(C)), C])
+    by = np.linalg.lstsq(Cc * sw[:, None], y * sw, rcond=None)[0]
+    m = len(ratios)
+    if P.shape[1] == 0:
+        return np.repeat(by[:, None], m, axis=1), np.zeros((0, m))
+    Bx = np.linalg.lstsq(Cc * sw[:, None], P * sw[:, None], rcond=None)[0]
+    mu = (w[:, None] * P).sum(0) / w.sum()
+    s = np.sqrt((w[:, None] * (P - mu) ** 2).sum(0) / w.sum())
+    s[s == 0] = 1.0
+    Xs = (P - Cc @ Bx) / s
+    yt = y - Cc @ by
+    amax = max(float(np.max(np.abs((Xs * sw[:, None]).T @ (yt * sw)))) / len(y), 1e-12)
+    _, coefs, _ = enet_path(Xs * sw[:, None], yt * sw, l1_ratio=1.0, alphas=amax * ratios, max_iter=50000)
+    gam = coefs / s[:, None]
+    return by[:, None] - Bx @ gam, gam
+
+
+def _u_predict(C, P, beta, gam):
+    return np.column_stack([np.ones(len(C)), C]) @ beta + P @ gam
+
+
+def _u_folds(groups, k, seed):
+    u = np.unique(groups)
+    np.random.default_rng(seed).shuffle(u)
+    fid = {b: i % k for i, b in enumerate(u)}
+    return np.array([fid[b] for b in groups])
+
+
+def _u_cv_curve(C, P, y, w, groups, k, reps, seed):
+    """Weighted CV error of log rent at every penalty; whole buildings are held out."""
+    err, tot = np.zeros(len(RATIOS)), 0.0
+    for r in range(reps):
+        f = _u_folds(groups, k, seed + r)
+        for i in range(k):
+            tr, te = f != i, f == i
+            beta, gam = _u_path(C[tr], P[tr], y[tr], w[tr], RATIOS)
+            pr = _u_predict(C[te], P[te], beta, gam)
+            err += (w[te, None] * (y[te, None] - pr) ** 2).sum(0)
+            tot += w[te].sum()
+    return err / tot
+
+
+def _u_outer_cv(C, P, y, w, groups, raw_w):
+    """Honest out-of-building predictions: in every outer fold the penalty is re-chosen
+    on that fold's training buildings only, so the selection step is inside the test."""
+    act = np.exp(y)
+    out = dict(lasso=[], core=[], median=[], log_res=[], ratios=[])
+    for r in range(CV_REPEATS):
+        f = _u_folds(groups, 10, 1000 + r)
+        pl, pc, pm = np.zeros(len(y)), np.zeros(len(y)), np.zeros(len(y))
+        for i in range(10):
+            tr, te = f != i, f == i
+            e = _u_cv_curve(C[tr], P[tr], y[tr], w[tr], groups[tr], 5, INNER_REPEATS, 10 * r + i)
+            j = int(np.argmin(e))
+            out["ratios"].append(float(RATIOS[j]))
+            for P_, ratio_idx, target in ((P, j, pl), (P[:, :0], 0, pc)):
+                beta, gam = _u_path(C[tr], P_[tr], y[tr], w[tr], RATIOS[[ratio_idx]])
+                fit_tr = _u_predict(C[tr], P_[tr], beta, gam)[:, 0]
+                smear = float(np.average(np.exp(y[tr] - fit_tr), weights=w[tr]))
+                target[te] = np.exp(_u_predict(C[te], P_[te], beta, gam)[:, 0]) * smear
+            pm[te] = np.median(act[tr])
+        out["lasso"].append(pl)
+        out["core"].append(pc)
+        out["median"].append(pm)
+        out["log_res"].append(y - np.log(pl))
+    def score(preds):
+        rows = []
+        for p in preds:
+            e = np.abs(p - act)
+            rows.append((np.average(e, weights=raw_w), np.average(e / act, weights=raw_w) * 100,
+                         e.mean(), (e / act).mean() * 100))
+        return [float(v) for v in np.mean(rows, axis=0)]
+    out["scores"] = {k: score(out[k]) for k in ("lasso", "core", "median")}
+    sst = float(np.sum((y - y.mean()) ** 2))
+    out["cv_r2"] = float(np.mean([1 - np.sum(r ** 2) / sst for r in out["log_res"]]))
+    return out
+
+
+def fit_units(raw, source_label, penalty_fraction=None):
+    d, steps = clean_units(raw)
+    n = len(d)
+    if n < 100 or d["listing_key"].nunique() < 20:
+        sys.exit(f"Only {n} usable rows in {d['listing_key'].nunique()} buildings; too few for this model.")
+    core, pen, meta = _units_design(d)
+    C, P = core.values, pen.values
+    y, w, groups = np.log(d["rent"].values), d["w"].values, d["listing_key"].values
+
+    cv = _u_outer_cv(C, P, y, w, groups, d["w"].values)
+    curve = np.mean([_u_cv_curve(C, P, y, w, groups, 10, 1, 200 + s) for s in range(SELECT_REPEATS)], axis=0)
+    j = int(np.argmin(curve)) if penalty_fraction is None else int(np.argmin(np.abs(RATIOS - penalty_fraction)))
+    beta, gam = _u_path(C, P, y, w, RATIOS[[j]])
+    beta, gam = beta[:, 0], gam[:, 0]
+    fitted = _u_predict(C, P, beta[:, None], gam[:, None])[:, 0]
+    resid = y - fitted
+    smear = float(np.average(np.exp(resid), weights=w))
+    r2 = 1 - float(np.sum(w * resid ** 2) / np.sum(w * (y - np.average(y, weights=w)) ** 2))
+
+    rng = np.random.default_rng(0)
+    ub = np.unique(groups)
+    idx = {b: np.where(groups == b)[0] for b in ub}
+    bb, gg = [], []
+    for _ in range(N_BOOT):
+        ii = np.concatenate([idx[b] for b in rng.choice(ub, len(ub))])
+        b_, g_ = _u_path(C[ii], P[ii], y[ii], w[ii], RATIOS[[j]])
+        bb.append(b_[:, 0])
+        gg.append(g_[:, 0])
+    bb, gg = np.array(bb), np.array(gg)
+    blo, bhi = np.percentile(bb, [2.5, 97.5], axis=0)
+    glo, ghi = np.percentile(gg, [2.5, 97.5], axis=0)
+    freq = (gg != 0).mean(axis=0)
+
+    coefs = {}
+    for k, name in enumerate(CORE):
+        coefs[name] = {"coef": round(float(beta[k + 1]), 5), "ci95": [round(float(blo[k + 1]), 5), round(float(bhi[k + 1]), 5)]}
+    for k, name in enumerate(pen.columns):
+        if gam[k] != 0:
+            coefs[name] = {"coef": round(float(gam[k]), 5), "ci95": [round(float(glo[k]), 5), round(float(ghi[k]), 5)],
+                           "selected_share": round(float(freq[k]), 3)}
+    kept_amen = [c for c in pen.columns if c in meta["amenities"] and gam[list(pen.columns).index(c)] != 0]
+    zeroed = [c for c in pen.columns if gam[list(pen.columns).index(c)] == 0]
+    q = {k: round(float(np.quantile(np.concatenate(cv["log_res"]), v)), 4)
+         for k, v in {"p10": .1, "p25": .25, "p75": .75, "p90": .9}.items()}
+    sc = cv["scores"]
+    improvement = (sc["median"][2] - sc["lasso"][2]) / sc["median"][2] * 100
+    means = {c: round(float(np.average(core[c], weights=w)), 5) for c in CORE}
+
+    caveats = [
+        f"Fit on {n} units in {meta['n_buildings']} buildings. Units in one building share their amenities and "
+        "location, so the effective sample for amenity and zip effects is the number of buildings, not units.",
+        "Validation holds out whole buildings, so the error quoted is for a unit in a building the model has not seen.",
+        "Amenities are building-level advertised features. A building that does not list an amenity is coded "
+        "'no', but listings often omit amenities they have, which pulls amenity effects toward zero.",
+        "Amenity and zip effects are associations. Buildings with more amenities tend to be newer and better "
+        "located, and the lasso picks among highly overlapping amenities somewhat arbitrarily.",
+        "Asking rents from available units, not signed leases; fees and concessions are not modeled.",
+    ]
+    thin = [k + "-bed" for k, v in meta["beds_counts"].items() if v < 30]
+    if thin:
+        caveats.append(f"Very few {', '.join(thin)} units in the training data: estimates for those sizes are not reliable.")
+    if meta["skipped"]:
+        caveats.append("Amenities too rare or too common to estimate: " + "; ".join(meta["skipped"]) + ".")
+    reliability = (f"moderate: typical out-of-building error about {sc['lasso'][3]:.0f}% per listing "
+                   f"(plain median: {sc['median'][3]:.0f}%); cross-validated R2 on log rent {cv['cv_r2']:.2f}")
+    info = dict(trained=str(datetime.date.today()), source=source_label, method="lasso (L1), penalty by grouped cross-validation",
+                penalty_fraction_of_max=round(float(RATIOS[j]), 4),
+                n_raw=int(len(raw)), n_used=int(n), n_buildings=meta["n_buildings"],
+                cleaning=[f"dropped {name}: {c} rows" for name, c in steps],
+                weights="each building counts as 1 in total (file 'weight' column), so large buildings do not dominate",
+                predictors=[c for c in coefs], amenities_kept=kept_amen, set_to_zero_by_lasso=zeroed,
+                r2_in_sample=round(r2, 3), r2_cross_validated=round(cv["cv_r2"], 3),
+                validation=dict(
+                    design=f"10-fold cross-validation holding out whole buildings, repeated {CV_REPEATS}x; "
+                           "the penalty is re-chosen (5-fold, buildings held out) inside every fold",
+                    lasso=dict(mae_usd=round(sc["lasso"][2]), mape_pct=round(sc["lasso"][3], 1),
+                               building_weighted_mae_usd=round(sc["lasso"][0]), building_weighted_mape_pct=round(sc["lasso"][1], 1)),
+                    beds_baths_sqft_distance_only=dict(mae_usd=round(sc["core"][2]), mape_pct=round(sc["core"][3], 1)),
+                    plain_median=dict(mae_usd=round(sc["median"][2]), mape_pct=round(sc["median"][3], 1)),
+                    mae_improvement_over_median_pct=round(improvement, 1)),
+                reliability=reliability, caveats=caveats)
+    params = dict(
+        info=info, const=round(float(beta[0]), 5), coefs=coefs,
+        amenity_share_yes={c: round(meta["shares"][c], 3) for c in kept_amen},
+        means=means, smearing=round(smear, 5), resid_q=q,
+        support=dict(beds=[float(d["beds"].min()), float(d["beds"].max())], beds_counts=meta["beds_counts"],
+                     baths=[float(d["baths"].min()), float(d["baths"].max())],
+                     sqft=[float(d["sqft"].min()), float(d["sqft"].max())],
+                     zips=sorted(d["zip_code"].unique().tolist()),
+                     rent=[float(d["rent"].min()), float(d["rent"].max())]),
+        zip_groups=[f"zip_{z}" for z in meta["zip_groups"]], zip_distance_km=meta["zip_dist"],
+        screen=dict(skipped=meta["skipped"]),
+        _report=dict(curve=(curve, j), cv=cv, candidates=list(pen.columns), n_amen=len(meta["amenities"])))
+    return params, steps
+
+
+def report_units(p, steps):
+    i, r = p["info"], p["_report"]
+    for name, n in steps:
+        print(f"dropped {n:>4}  {name}")
+    print(f"\nused {i['n_used']} units in {i['n_buildings']} buildings")
+    print(f"lasso over {len(r['candidates'])} penalized variables ({r['n_amen']} amenities + zip effects); "
+          f"unpenalized: beds, baths, log(sqft), distance to downtown")
+    gain = (1 - r["curve"][0][r["curve"][1]] / r["curve"][0][0]) * 100
+    print(f"penalty = {i['penalty_fraction_of_max']:.3f} of the penalty that zeroes everything "
+          f"(chosen by grouped cross-validation; versus dropping every zip and amenity term it lowers "
+          f"cross-validated squared error by only {gain:.1f}%)")
+    sc = r["cv"]["scores"]
+    v = i["validation"]
+    print(f"\nout-of-building error ({v['design']}):")
+    print(f"  lasso                          MAE ${sc['lasso'][2]:>6,.0f}  ({sc['lasso'][3]:.1f}%)   building-weighted ${sc['lasso'][0]:,.0f} ({sc['lasso'][1]:.1f}%)")
+    print(f"  beds+baths+sqft+distance only  MAE ${sc['core'][2]:>6,.0f}  ({sc['core'][3]:.1f}%)")
+    print(f"  plain median                   MAE ${sc['median'][2]:>6,.0f}  ({sc['median'][3]:.1f}%)")
+    print(f"R2 on log rent: in-sample {i['r2_in_sample']}, cross-validated {i['r2_cross_validated']}")
+    print("\ncoefficients (95% interval from resampling whole buildings):")
+    for k, c in p["coefs"].items():
+        eff = {"log_sqft": "elasticity", "dist_km": f"{(math.exp(c['coef']) - 1) * 100:+.1f}%/km"}.get(
+            k, f"{(math.exp(c['coef']) - 1) * 100:+.1f}%")
+        tail = f"  kept in {c['selected_share']:.0%} of resamples" if "selected_share" in c else ""
+        print(f"  {k:<20} {c['coef']:+.4f} ({eff:>10})  [{c['ci95'][0]:+.3f}, {c['ci95'][1]:+.3f}]{tail}")
+    print(f"set to zero: {', '.join(i['set_to_zero_by_lasso']) or 'none'}")
+    print("\ncaveats:")
+    for c in i["caveats"]:
+        print("  -", c)
+
+
+TEMPLATE_UNITS = '''"""SF rent model fit on available-unit listings (lasso, penalty chosen by cross-validation).
+
+Trained @@TRAINED@@ on @@N_USED@@ units in @@N_BUILDINGS@@ buildings.
+Standard library only. Drop this file next to app.py and:
+
+    import rent_model
+    r = rent_model.predict_rent(bedrooms=1, bathrooms=1, sqft=700, zip_code="94107",
+                                amenities={"in_unit_laundry": True, "gym": False})
+    r["estimate"], r["low"], r["high"], r["warnings"]
+
+READ THIS BEFORE USING THE NUMBERS
+  Size, bedrooms and location explain most of the rent. Building amenities add
+  little that can be measured reliably (see MODEL_INFO["validation"]): the
+  lasso keeps only the ones that survive cross-validation, and each kept effect
+  has a wide interval (PRICE_MODEL["coefficients"][name]["ci95"]). Amenity and
+  zip effects are associations, not proven prices. The estimate is a comp-based
+  asking-rent range, not a recommended rent. The vacancy curve
+  (predict_vacancy) is still a placeholder.
+
+The model is log(asking monthly rent) = const + sum(coef * variable), and
+rent = exp(that) * smearing. For a yes/no variable, exp(coef) - 1 is the percent
+rent difference. Beds, baths, log(sqft) and distance to downtown are never
+penalized; zip and amenity effects are shrunk toward zero by the lasso, and those
+set exactly to zero are listed in MODEL_INFO["set_to_zero_by_lasso"].
+"""
+import math
+
+MODEL_INFO = @@INFO@@
+
+PRICE_MODEL = {
+    "target": "log(advertised asking monthly rent, USD)",
+    "const": @@CONST@@,
+    "coefficients": @@COEFS@@,
+    "amenity_share_yes": @@SHARES@@,  # share of buildings with the amenity (kept amenities only)
+    "means": @@MEANS@@,
+    "smearing": @@SMEAR@@,  # corrects exp() bias when converting log-rent back to dollars
+    "log_residual_quantiles_out_of_sample": @@RESID_Q@@,
+    "support": @@SUPPORT@@,
+    "zip_groups": @@ZIP_GROUPS@@,  # zips with their own effect; other training zips share "zip_other"
+    "zip_distance_km": @@ZIP_DIST@@,  # average distance to Union Square, used when no lat/lon is given
+}
+
+VACANCY_MODEL = {
+    "is_placeholder": True,
+    "note": "Not estimated from data. Shape and numbers are illustrative only.",
+    "base_days": 30.0,        # placeholder: days to lease at market rent
+    "price_sensitivity": 3.0, # placeholder: how fast days grow as price exceeds market
+}
+
+
+def _dist_km(lat, lon):
+    return math.hypot((lat - 37.788) * 111.0, (lon + 122.407) * 111.0 * math.cos(math.radians(37.8)))
+
+
+def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenities=None,
+                 latitude=None, longitude=None):
+    """Return {"estimate", "low", "high", "effects", "reliability", "warnings"}.
+
+    bedrooms: 0 = studio. amenities: a dict like {"in_unit_laundry": True, "gym": None}
+    (None = not known) or a list of amenity names the building has. Give latitude and
+    longitude if you have them; otherwise distance to downtown is taken from the zip.
+    low/high are the 10th/90th percentile of out-of-building errors, so about 80% of
+    held-out listings fell inside that range.
+    """
+    pm = PRICE_MODEL
+    coefs = pm["coefficients"]
+    sup = pm["support"]
+    warnings = []
+    if bedrooms is not None:
+        lo, hi = sup["beds"]
+        if not lo <= bedrooms <= hi:
+            warnings.append(f"bedrooms outside the {lo:g}-{hi:g} range of the training data")
+        elif sup["beds_counts"].get(str(int(round(bedrooms))), 0) < 30:
+            warnings.append(f"only {sup['beds_counts'].get(str(int(round(bedrooms))), 0)} training units have "
+                            f"{bedrooms:g} bedrooms; the estimate is unreliable")
+    if bathrooms is not None and not sup["baths"][0] <= bathrooms <= sup["baths"][1]:
+        warnings.append("bathrooms are outside the range of the training data")
+    if sqft is not None and not sup["sqft"][0] <= sqft <= sup["sqft"][1]:
+        warnings.append("square footage is outside the range of the training data")
+
+    z = str(zip_code)[:5] if zip_code is not None else None
+    zip_name = None
+    if z is not None:
+        if "zip_" + z in pm["zip_groups"]:
+            zip_name = "zip_" + z
+        elif z in sup["zips"]:
+            zip_name = "zip_other"
+        else:
+            warnings.append("zip code is not in the training data; no zip adjustment applied")
+    if latitude is not None and longitude is not None:
+        dist = _dist_km(latitude, longitude)
+    elif z in pm["zip_distance_km"]:
+        dist = pm["zip_distance_km"][z]
+    else:
+        dist = None
+    inputs = {"beds": bedrooms, "baths": bathrooms, "log_sqft": math.log(sqft) if sqft else None,
+              "dist_km": dist}
+    if isinstance(amenities, dict):
+        flags = {k: (None if v is None else bool(v)) for k, v in amenities.items()}
+    else:
+        flags = {k: True for k in (amenities or [])}
+
+    log_rent = pm["const"]
+    used = set()
+    for name, c in coefs.items():
+        if name in inputs:
+            x = inputs[name]
+            if x is None:
+                x = pm["means"][name]
+                warnings.append(f"{name} not given; using the training average")
+            log_rent += c["coef"] * x
+        elif name.startswith("zip_"):
+            if name == zip_name:
+                log_rent += c["coef"]
+        else:
+            used.add(name)
+            v = flags.get(name)
+            if v is None:
+                share = pm["amenity_share_yes"][name]
+                warnings.append(f"{name} not specified; assuming the typical share "
+                                f"({share:.0%}) of buildings have it")
+                log_rent += c["coef"] * share
+            else:
+                log_rent += c["coef"] * (1.0 if v else 0.0)
+    if zip_name is None and z is None:
+        warnings.append("no zip code given; no zip adjustment applied")
+    for name in flags:
+        if name not in used:
+            warnings.append(f"{name} is not used by this model")
+
+    est = math.exp(log_rent) * pm["smearing"]
+    q = pm["log_residual_quantiles_out_of_sample"]
+    effects = {}
+    for name, c in coefs.items():
+        if name == "log_sqft":
+            effects["sqft_pct_per_10pct_larger"] = round((1.1 ** c["coef"] - 1) * 100, 1)
+        elif name == "dist_km":
+            effects["dist_pct_per_km_from_downtown"] = round((math.exp(c["coef"]) - 1) * 100, 1)
+        else:
+            effects[name + "_pct"] = round((math.exp(c["coef"]) - 1) * 100, 1)
+    return {
+        "estimate": round(est),
+        "low": round(est * math.exp(q["p10"])),
+        "high": round(est * math.exp(q["p90"])),
+        "effects": effects,
+        "reliability": MODEL_INFO["reliability"],
+        "warnings": warnings,
+    }
+
+
+def predict_vacancy(price, market_rent):
+    """PLACEHOLDER. Illustrative days-to-lease at `price` given `market_rent`
+    (use predict_rent(...)["estimate"]). Not estimated from data."""
+    v = VACANCY_MODEL
+    return v["base_days"] * (price / market_rent) ** v["price_sensitivity"]
+'''
+
+
+def render_units(p):
+    fmt = lambda o: pprint.pformat(o, width=100, sort_dicts=False)  # noqa: E731
+    out = TEMPLATE_UNITS
+    for key, val in {
+        "@@TRAINED@@": p["info"]["trained"], "@@N_USED@@": str(p["info"]["n_used"]),
+        "@@N_BUILDINGS@@": str(p["info"]["n_buildings"]), "@@INFO@@": fmt(p["info"]),
+        "@@CONST@@": repr(p["const"]), "@@COEFS@@": fmt(p["coefs"]),
+        "@@SHARES@@": fmt(p["amenity_share_yes"]), "@@MEANS@@": fmt(p["means"]),
+        "@@SMEAR@@": repr(p["smearing"]), "@@RESID_Q@@": fmt(p["resid_q"]),
+        "@@SUPPORT@@": fmt(p["support"]), "@@ZIP_GROUPS@@": fmt(p["zip_groups"]),
+        "@@ZIP_DIST@@": fmt(p["zip_distance_km"]),
+    }.items():
+        out = out.replace(key, val)
+    return out
 
 
 def main():
     ap = argparse.ArgumentParser(description="Fit the SF rent regression and write rent_model.py")
     ap.add_argument("input", help="listings .xlsx (sheet 'All SF Listings'), listings .csv, or RealtyAPI comps .csv")
     ap.add_argument("--out", default="rent_model.py")
+    ap.add_argument("--penalty-fraction", type=float, default=None,
+                    help="unit-level training files only: override the cross-validated lasso penalty with this "
+                         "fraction (0-1) of the penalty that zeroes everything. Smaller keeps more zip/amenity "
+                         "terms. Not chosen by cross-validation, so say so wherever the numbers are used.")
+    ap.add_argument("--method", choices=["lasso", "subset"], default="lasso",
+                    help="small hand-reviewed comps files only: lasso (default) or best-subset OLS chosen by "
+                         "leave-one-out. Unit-level training files always use the lasso.")
     a = ap.parse_args()
     table = read_table(a.input)
+    if "asking_rent_usd_month" not in table.columns and UNITS_REQUIRED <= set(table.columns):
+        label = a.input.replace("\\", "/").split("/")[-1]
+        params, steps = fit_units(table, label + " (RealtyAPI available units; advertised asking rents)",
+                                  a.penalty_fraction)
+        open(a.out, "w", encoding="utf-8").write(render_units(params))
+        report_units(params, steps)
+        print("\nwrote", a.out)
+        return
     label = a.input.replace("\\", "/").split("/")[-1]
     if "asking_rent_usd_month" in table.columns:
-        params, steps = fit_comps(table, label + " (RealtyAPI comps; advertised asking rents, hand-reviewed)")
+        params, steps = fit_comps(table, label + " (RealtyAPI comps; advertised asking rents, hand-reviewed)",
+                                   a.method)
         open(a.out, "w", encoding="utf-8").write(render_comps(params))
         report_comps(params, steps)
         print("\nwrote", a.out)
