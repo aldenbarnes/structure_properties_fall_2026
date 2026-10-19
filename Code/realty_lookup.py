@@ -1,23 +1,18 @@
-"""Look up an SF apartment on RealtyAPI, edit its features, and estimate rent with rent_model.
+"""RealtyAPI lookup for the rent app: find a listing, fetch its details, and pull out units,
+location and amenities in the form rent_model.predict_rent takes.
 
-Run in Colab or Jupyter (needs ipywidgets, which Colab already has):
-
-    import rent_lookup_tool
-    rent_lookup_tool.open_tool(api_key)   # api_key=None: type features in by hand
+Used by rent_lookup_app.py (Streamlit). Standard library only.
 
 What one lookup costs
   An apartments.com URL or listing key: 1 request (/details/byid).
   A street address: 1 search request (/search/bylocation) to find the listing,
-  then 1 /details/byid request for the property you pick. Responses are cached
-  for the session, so changing units or features never calls the API again.
-
-Every feature the lookup fills in can be changed before estimating. A blank box
-means "not known"; rent_model then uses its training average and says so.
+  then 1 /details/byid request for the property you pick. Client caches
+  responses, so asking for the same thing twice never calls the API again.
 
 The /details/byid schema has not been checked against a live response from this
 code, so units are found by looking for objects with bed/bath/sqft/rent fields
-anywhere in the response. If a lookup finds no units, open "Raw response" and
-adjust UNIT_KEYS below to match the field names you see.
+anywhere in the response. If a lookup finds no units, look at the raw response
+in the app and adjust UNIT_KEYS below to match the field names you see.
 """
 import json
 import math
@@ -26,8 +21,6 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
-import rent_model
 
 BASE_URL = "https://apartments.realtyapi.io"
 MAX_REQUESTS = 20         # per session; a guard against runaway credit use
@@ -320,208 +313,3 @@ def search(client, address):
 
 def details(client, listing_key):
     return client.get("/details/byid", {"listingKey": listing_key})
-
-
-# ---------- form ----------
-
-def _fmt(x):
-    if x is None:
-        return ""
-    return "{:.6f}".format(x).rstrip("0").rstrip(".") if isinstance(x, float) else str(x)
-
-
-def _parse_box(text, name, errors, lo=None, hi=None):
-    text = (text or "").strip().replace(",", "").replace("$", "")
-    if not text:
-        return None
-    try:
-        v = float(text)
-    except ValueError:
-        errors.append("{}: '{}' is not a number".format(name, text))
-        return None
-    if (lo is not None and v < lo) or (hi is not None and v > hi):
-        errors.append("{}: {:g} looks wrong".format(name, v))
-        return None
-    return v
-
-
-def open_tool(api_key=None):
-    """Build and display the lookup form. Returns the widget box."""
-    import html
-    import ipywidgets as w
-    from IPython.display import display
-
-    client = Client(api_key) if api_key else None
-    state = {"results": [], "units": [], "details": None, "search_result": None}
-    wide = w.Layout(width="95%")
-    label_style = {"description_width": "140px"}
-
-    query = w.Text(placeholder="e.g. 1140 Harrison St, San Francisco, CA 94103  or an apartments.com URL",
-                   description="Address", layout=wide, style=label_style)
-    lookup_btn = w.Button(description="Look up", button_style="primary", icon="search")
-    status = w.HTML()
-    prop_pick = w.Dropdown(description="Property", layout=wide, style=label_style)
-    prop_btn = w.Button(description="Load this property", icon="download")
-    prop_box = w.VBox([prop_pick, prop_btn], layout=w.Layout(display="none"))
-    unit_pick = w.Dropdown(description="Unit", layout=wide, style=label_style)
-    unit_box = w.VBox([unit_pick], layout=w.Layout(display="none"))
-
-    beds = w.Text(description="Bedrooms (0=studio)", style=label_style)
-    baths = w.Text(description="Bathrooms", style=label_style)
-    sqft = w.Text(description="Square feet", style=label_style)
-    zip_code = w.Text(description="Zip code", style=label_style)
-    lat = w.Text(description="Latitude", style=label_style)
-    lon = w.Text(description="Longitude", style=label_style)
-    amen = {k: w.ToggleButtons(options=["Yes", "No", "Unknown"], value="Unknown",
-                               description=AMENITY_LABELS[k], style={"description_width": "140px", "button_width": "80px"})
-            for k in MODEL_AMENITIES}
-    listed = w.HTML()
-    other_amen = w.HTML()
-    estimate_btn = w.Button(description="Estimate rent", button_style="success", icon="calculator")
-    result = w.HTML()
-    raw = w.Output()
-    raw_acc = w.Accordion(children=[raw])
-    raw_acc.set_title(0, "Raw response (for checking fields)")
-    raw_acc.selected_index = None
-
-    def say(msg, kind="info"):
-        color = {"info": "inherit", "error": "#b00020", "ok": "#1b7f3b"}[kind]
-        status.value = "<span style='color:{}'>{}</span>".format(color, html.escape(msg))
-
-    def set_amenities(flags):
-        for k, box in amen.items():
-            v = flags.get(k)
-            box.value = "Unknown" if v is None else ("Yes" if v else "No")
-
-    def load_property(listing_key, search_result=None):
-        say("Fetching details for {} ...".format(listing_key))
-        try:
-            data = details(client, listing_key)
-        except APIError as exc:
-            say(str(exc), "error")
-            return
-        state.update(details=data, search_result=search_result)
-        summary = property_summary(search_result, data)
-        zip_code.value = summary["zip_code"] or ""
-        lat.value = _fmt(summary["latitude"])
-        lon.value = _fmt(summary["longitude"])
-        names = amenity_names(search_result or {}, data)
-        set_amenities(model_amenities(names))
-        unused = [n for n in names if not any(_norm(n) == _norm(t) for ts in MODEL_AMENITIES.values() for t in ts)]
-        other_amen.value = ("<small><b>Other advertised amenities (not used by the model):</b> {}</small>"
-                            .format(html.escape(", ".join(unused))) if unused else "")
-        units = find_units(data)
-        state["units"] = units
-        options = [(unit_label(u), i) for i, u in enumerate(units)] + [("Enter features by hand", -1)]
-        unit_pick.options = options
-        unit_box.layout.display = None
-        unit_pick.value = 0 if units else -1
-        fill_unit()
-        with raw:
-            raw.clear_output()
-            for path, value in leaves(data):
-                print(path, "=", json.dumps(value)[:200])
-        where = summary["address"] or summary["name"] or listing_key
-        if units:
-            say("{}: {} unit(s) / floor plan(s) found. Requests used this session: {}."
-                .format(where, len(units), client.requests), "ok")
-        else:
-            say("{}: no units found in the response. Enter features by hand, or check the raw response."
-                .format(where), "error")
-
-    def fill_unit(*_):
-        i = unit_pick.value
-        if i is None or i < 0 or i >= len(state["units"]):
-            listed.value = ""
-            return
-        u = state["units"][i]
-        beds.value, baths.value, sqft.value = _fmt(u.get("beds")), _fmt(u.get("baths")), _fmt(u.get("sqft"))
-        listed.value = ("<small>Listed asking rent: <b>${:,.0f}</b></small>".format(u["rent"])
-                        if u.get("rent") is not None else "")
-        result.value = ""
-
-    def on_lookup(_):
-        text = query.value.strip()
-        result.value = ""
-        if not text:
-            say("Type an address first.", "error")
-            return
-        if client is None:
-            say("No RealtyAPI key given, so lookups are off. Fill in the features by hand.", "error")
-            return
-        key = listing_key_from_input(text)
-        if key:
-            prop_box.layout.display = "none"
-            load_property(key)
-            return
-        say("Searching ...")
-        try:
-            results = search(client, text)
-        except APIError as exc:
-            say(str(exc), "error")
-            return
-        state["results"] = results
-        if not results:
-            say("No listings found for that address. Try adding the city and zip, or paste the apartments.com URL.", "error")
-            return
-        if len(results) == 1:
-            prop_box.layout.display = "none"
-            load_property(results[0]["listingKey"], results[0])
-            return
-        prop_pick.options = [("{} | {}".format(r.get("name") or "", r.get("oneLineAddress") or r["listingKey"]), i)
-                             for i, r in enumerate(results)]
-        prop_pick.value = 0
-        prop_box.layout.display = None
-        say("{} listings matched. Pick the right property, then Load.".format(len(results)))
-
-    def on_prop(_):
-        r = state["results"][prop_pick.value]
-        load_property(r["listingKey"], r)
-
-    def on_estimate(_):
-        errors = []
-        args = dict(
-            bedrooms=_parse_box(beds.value, "Bedrooms", errors, 0, 10),
-            bathrooms=_parse_box(baths.value, "Bathrooms", errors, 0, 10),
-            sqft=_parse_box(sqft.value, "Square feet", errors, 50, 20000),
-            zip_code=zip_code.value.strip() or None,
-            latitude=_parse_box(lat.value, "Latitude", errors, 37, 38.5),
-            longitude=_parse_box(lon.value, "Longitude", errors, -123.5, -121.5),
-            amenities={k: (None if b.value == "Unknown" else b.value == "Yes") for k, b in amen.items()},
-        )
-        if (args["latitude"] is None) != (args["longitude"] is None):
-            errors.append("Give both latitude and longitude, or neither")
-        if errors:
-            result.value = "<span style='color:#b00020'>{}</span>".format(html.escape("; ".join(errors)))
-            return
-        r = rent_model.predict_rent(**args)
-        rows = ["<h3 style='margin:4px 0'>Estimated asking rent: ${:,} / month</h3>".format(r["estimate"]),
-                "<div>Likely range: ${:,} to ${:,} (about 80% of test listings fell in this range)</div>"
-                .format(r["low"], r["high"])]
-        i = unit_pick.value
-        if state["units"] and i is not None and 0 <= i < len(state["units"]) and state["units"][i].get("rent"):
-            listed_rent = state["units"][i]["rent"]
-            rows.append("<div>Listed asking rent: ${:,.0f} ({:+.0%} vs estimate)</div>"
-                        .format(listed_rent, listed_rent / r["estimate"] - 1))
-        rows.append("<div><small>Model reliability: {}</small></div>".format(html.escape(r["reliability"])))
-        if r["warnings"]:
-            rows.append("<div><b>Warnings</b><ul>{}</ul></div>".format(
-                "".join("<li>{}</li>".format(html.escape(x)) for x in r["warnings"])))
-        result.value = "".join(rows)
-
-    lookup_btn.on_click(on_lookup)
-    prop_btn.on_click(on_prop)
-    unit_pick.observe(fill_unit, names="value")
-    estimate_btn.on_click(on_estimate)
-    if client is None:
-        say("No RealtyAPI key: lookups are off, but you can type features in and estimate.")
-
-    ui = w.VBox([
-        w.HTML("<h3 style='margin:4px 0'>SF rent estimate</h3>"),
-        w.HBox([query, lookup_btn]), status, prop_box, unit_box,
-        w.HTML("<b>Features</b> <small>(edit anything; leave blank if unknown)</small>"),
-        beds, baths, sqft, zip_code, lat, lon, *amen.values(), listed, other_amen,
-        estimate_btn, result, raw_acc,
-    ])
-    display(ui)
-    return ui

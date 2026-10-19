@@ -2,3 +2,13 @@
 
 ### Test Colab
 [![Open test_colab in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/aldenbarnes/structure_properties_fall_2026/blob/main/Code/test_colab.ipynb)
+
+### SF rent lookup app
+Look up an apartment on RealtyAPI, pick the unit, edit any feature, and get a rent estimate from `Code/rent_model.py`.
+
+```
+pip install -r Code/requirements.txt
+streamlit run Code/rent_lookup_app.py
+```
+
+Put the RealtyAPI key in `.streamlit/secrets.toml` as `REALTYAPI_KEY = "..."` (ignored by git), set the `REALTYAPI_KEY` environment variable, or paste it in the app's sidebar. On Streamlit Community Cloud, point the app at `Code/rent_lookup_app.py` and add the key under the app's Secrets settings.

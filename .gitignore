@@ -1,2 +1,5 @@
 .env
 __pycache__/
+
+# Streamlit secrets (API keys)
+.streamlit/secrets.toml
