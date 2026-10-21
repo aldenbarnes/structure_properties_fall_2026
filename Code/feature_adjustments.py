@@ -1,8 +1,9 @@
 """Rent adjustments for features rent_model does not estimate, using premiums from published studies.
 
-rent_model is fit on SF listings and only keeps size, location, laundry and doorman. Everything
-else here comes from outside research (see EFFECTS: each entry has its sources and a caveat), so
-these adjustments are assumptions layered on top of the model, not something the model measured.
+rent_model is fit on SF listings and prices size, location and the amenities its lasso kept
+(rent_model.MODEL_INFO["amenities_kept"]). The app passes those amenities to the model and skips
+them here (choices["skip"]). Everything else comes from outside research (see EFFECTS: each entry
+has its sources and a caveat), so these adjustments are assumptions layered on top of the model.
 
     adj = feature_adjustments.adjust(model_estimate, choices)
     adj["estimate"], adj["factor"], adj["rows"]
@@ -297,10 +298,14 @@ def adjustments(choices):
     choices: {"property_type": "...", "condition": "...", ..., "floor": 4 or None,
               "features": set of checked UNIT_FEATURES + BUILDING_FEATURES,
               "unticked_means_no": True if an unchecked feature is known to be missing
-                                   (False: unchecked = unknown, so nothing is subtracted)}
+                                   (False: unchecked = unknown, so nothing is subtracted),
+              "skip": SELECTS keys and feature names rent_model already prices (no study premium)}
     """
     rows = []
+    skip = choices.get("skip") or set()
     for key, (label, _) in SELECTS.items():
+        if key in skip:
+            continue
         picked = choices.get(key)
         if not picked or picked == UNKNOWN or picked == BASELINE[key]:
             continue
@@ -324,6 +329,8 @@ def adjustments(choices):
         rows.append(_row("Floor", eff, steps, detail))
     checked = choices.get("features") or set()
     for feat in UNIT_FEATURES + BUILDING_FEATURES:
+        if feat in skip:
+            continue
         eff = EFFECTS.get(("feature", feat))
         if not eff or not eff["value"]:
             continue

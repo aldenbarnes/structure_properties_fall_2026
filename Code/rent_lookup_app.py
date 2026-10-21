@@ -1,7 +1,7 @@
 """SF rent lookup: find an apartment on RealtyAPI, pick the unit, edit any feature, get a rent estimate.
 
-The estimate is rent_model's prediction (size, location, laundry, doorman, fit on SF listings) plus
-adjustments for other features taken from published studies (feature_adjustments.py).
+The estimate is rent_model's prediction (size, location and the amenities its lasso kept, fit on SF
+listings) plus adjustments for other features taken from published studies (feature_adjustments.py).
 
 Run from the repo root:
 
@@ -23,25 +23,54 @@ import realty_lookup as rl
 import rent_model
 import sf_address
 
+try:
+    from streamlit_searchbox import st_searchbox
+except ImportError:          # fall back to a plain text box + suggestion list
+    st_searchbox = None
+
 st.set_page_config(page_title="SF rent lookup", page_icon=":house:", layout="centered")
 
 LAUNDRY = [fa.UNKNOWN, "None", "Shared in building", "In-unit washer and dryer"]
-DOORMAN = "Doorman / concierge"            # priced by rent_model, not by feature_adjustments
-CHECKS = fa.UNIT_FEATURES + [DOORMAN] + fa.BUILDING_FEATURES
+GARAGE = {"Shared garage space", "Assigned garage space", "Two or more spaces"}
+MATCH_METERS = 40            # a listing this close to the address's parcel is the same building
+
+# Amenities rent_model prices (whatever its last training run kept), and the form input feeding each.
+MODEL_AMENITIES = list(rent_model.PRICE_MODEL["amenity_share_yes"])
+MODEL_FROM_CHECKBOX = {"air_conditioning": "Air conditioning", "dishwasher": "Dishwasher", "fireplace": "Fireplace",
+                       "furnished": "Furnished", "gym": "Fitness center", "pool": "Pool",
+                       "balcony_patio": "Private outdoor space", "elevator": "Elevator",
+                       "hardwood_floors": "Hardwood floors", "walk_in_closets": "Walk-in closet",
+                       "den": "Home office / den", "car_charging_station": "EV charging",
+                       "roof_terrace": "Shared roof deck or yard"}
+MODEL_FROM_SELECT = {"parking": "parking", "utilities_included": "utilities"}
+MODEL_FROM_LAUNDRY = {"in_unit_laundry": "In-unit washer and dryer", "shared_laundry": "Shared in building"}
+# Model amenities with no matching field in the form get a checkbox of their own.
+EXTRA_MODEL = [m for m in MODEL_AMENITIES
+               if m not in MODEL_FROM_CHECKBOX and m not in MODEL_FROM_SELECT and m not in MODEL_FROM_LAUNDRY]
+EXTRA_LABELS = {"doorman_concierge": "Doorman / concierge", "washer_dryer_hookup": "Washer/dryer hookups"}
+# Form fields the SF model prices; feature_adjustments leaves these alone so nothing counts twice.
+MODEL_PRICED = ({MODEL_FROM_CHECKBOX[m] for m in MODEL_AMENITIES if m in MODEL_FROM_CHECKBOX}
+                | {MODEL_FROM_SELECT[m] for m in MODEL_AMENITIES if m in MODEL_FROM_SELECT})
+CHECKS = fa.UNIT_FEATURES + fa.BUILDING_FEATURES
 
 
 def ck(feature):
     return "x_" + feature
 
 
-# Values a new lookup resets to. f_* are the unit form's fields, s_* its dropdowns, x_* its checkboxes.
+def mk(model_name):
+    return "m_" + model_name
+
+
+# Values a new lookup resets to. f_* are the unit form's fields, s_* its dropdowns, x_*/m_* its checkboxes.
 FORM_DEFAULTS = {"f_beds": None, "f_baths": None, "f_sqft": None, "f_floor": None, "f_year": None, "f_zip": "",
                  "f_lat": None, "f_lon": None, "f_laundry": fa.UNKNOWN, "f_unticked_no": False,
-                 **{"s_" + k: fa.UNKNOWN for k in fa.SELECTS}, **{ck(f): False for f in CHECKS}}
+                 **{"s_" + k: fa.UNKNOWN for k in fa.SELECTS}, **{ck(f): False for f in CHECKS},
+                 **{mk(m): False for m in EXTRA_MODEL}}
 ss = st.session_state
-for k, v in {"results": [], "cands": [], "units": [], "details": None, "summary": None, "amen_names": [],
-             "building": None, "typed_unit": None, "typed_zip": None, "match_scores": [], "msg": None,
-             "unit_idx": -1, "load_id": 0, "result": None, "floor_note": None, **FORM_DEFAULTS}.items():
+for k, v in {"results": [], "units": [], "details": None, "summary": None, "amen_names": [], "building": None,
+             "typed_unit": None, "typed_zip": None, "msg": None, "last_pick": None, "unit_idx": -1,
+             "load_id": 0, "result": None, "floor_note": None, **FORM_DEFAULTS}.items():
     ss.setdefault(k, v)
 
 
@@ -57,13 +86,27 @@ def env_key():
 
 
 def get_client(key):
-    """One Client per browser session and key, so its response cache and request cap persist."""
+    """One Client per browser session and key, so its response cache, request cap and log persist."""
     if not key:
         return None
     if ss.get("client_key") != key:
         ss.client, ss.client_key = rl.Client(key), key
     return ss.client
 
+
+@st.cache_resource(show_spinner="Loading SF property records ...")
+def address_index():
+    try:
+        return sf_address.AddressIndex.load()
+    except OSError:
+        return None   # no Data/properties.csv: addresses are searched as typed
+
+
+def as_typed_query(text):
+    return text if re.search(r"san\s*francisco|\bsf\b", text, re.I) else text + ", San Francisco, CA"
+
+
+# ---------- filling the form ----------
 
 def apply_unit():
     """Copy the chosen unit's fields into the form. A new unit means any earlier estimate is stale."""
@@ -95,6 +138,41 @@ def set_location(building):
         ss.f_zip = ss.typed_zip or ""
 
 
+def fill_amenities(names):
+    """Tick the form's amenity fields from a listing's advertised amenity names."""
+    flags = rl.model_amenities(names, set(MODEL_AMENITIES) | set(MODEL_FROM_LAUNDRY) | set(MODEL_FROM_SELECT))
+    if flags["in_unit_laundry"]:
+        ss.f_laundry = "In-unit washer and dryer"
+    elif flags["shared_laundry"]:
+        ss.f_laundry = "Shared in building"
+    else:
+        ss.f_laundry = "None" if names else fa.UNKNOWN
+    if flags["parking"]:
+        ss.s_parking = "Shared garage space"          # listings say parking exists, not which kind
+    if flags["utilities_included"]:
+        ss.s_utilities = "Water, sewer, garbage"      # the smallest bundle; adjust if more is included
+    advertised = fa.checks_from_amenities(names)
+    for f in CHECKS:
+        ss[ck(f)] = f in advertised
+    for m, f in MODEL_FROM_CHECKBOX.items():
+        if flags.get(m):
+            ss[ck(f)] = True
+    for m in EXTRA_MODEL:
+        ss[mk(m)] = bool(flags.get(m))
+    ss.f_unticked_no = bool(names)       # a listing's amenity list says what the building lacks
+
+
+# ---------- lookup ----------
+
+def reset_lookup():
+    """Start a new lookup: forget the last property and clear its features."""
+    ss.results, ss.msg, ss.details, ss.units, ss.amen_names = [], None, None, [], []
+    ss.building, ss.typed_unit, ss.typed_zip = None, None, None
+    ss.unit_idx, ss.result, ss.floor_note = -1, None, None
+    for k, v in FORM_DEFAULTS.items():
+        ss[k] = v
+
+
 def load_property(client, listing_key, search_result=None):
     try:
         data = rl.details(client, listing_key)
@@ -103,24 +181,13 @@ def load_property(client, listing_key, search_result=None):
         return
     summary = rl.property_summary(search_result, data)
     names = rl.amenity_names(search_result or {}, data)
-    ss.details, ss.summary, ss.amen_names = data, summary, names
+    ss.details, ss.summary, ss.amen_names, ss.results = data, summary, names, []
     ss.units = rl.find_units(data)
     b = ss.building
     ss.f_zip = summary["zip_code"] or ss.typed_zip or ""
     ss.f_lat = summary["latitude"] if summary["latitude"] is not None else (b.latitude if b else None)
     ss.f_lon = summary["longitude"] if summary["longitude"] is not None else (b.longitude if b else None)
-    flags = rl.model_amenities(names)
-    if flags["in_unit_laundry"]:
-        ss.f_laundry = "In-unit washer and dryer"
-    elif flags["shared_laundry"]:
-        ss.f_laundry = "Shared in building"
-    else:
-        ss.f_laundry = "None" if names else fa.UNKNOWN
-    advertised = fa.checks_from_amenities(names)
-    for f in CHECKS:
-        ss[ck(f)] = f in advertised
-    ss[ck(DOORMAN)] = bool(flags["doorman_concierge"])
-    ss.f_unticked_no = bool(names)       # a listing's amenity list says what the building lacks
+    fill_amenities(names)
     ss.load_id += 1
     typed = [i for i, u in enumerate(ss.units) if sf_address.same_unit(ss.typed_unit, u.get("unit"))]
     ss.unit_idx = typed[0] if typed else (0 if ss.units else -1)
@@ -136,112 +203,107 @@ def load_property(client, listing_key, search_result=None):
                            "or check the raw response at the bottom.".format(where))
 
 
-def reset_lookup():
-    """Start a new lookup: forget the last property and clear its features."""
-    ss.results, ss.cands, ss.msg, ss.details, ss.units, ss.amen_names = [], [], None, None, [], []
-    ss.building, ss.typed_unit, ss.typed_zip = None, None, None
-    ss.unit_idx, ss.result, ss.floor_note = -1, None, None
-    for k, v in FORM_DEFAULTS.items():
-        ss[k] = v
+def rank_results(results, building):
+    """Annotate search results with distance from the building and whether they are the building.
+
+    A listing is the building when its address matches or its coordinates are within MATCH_METERS
+    of the parcel, which also catches listings that write the address differently (ranges, names).
+    """
+    rows = []
+    for r in results:
+        dist = score = None
+        if building is not None:
+            dist = rl.distance_m(building.latitude, building.longitude,
+                                 rl._num(r.get("latitude")), rl._num(r.get("longitude")))
+            score = sf_address.same_building(r.get("oneLineAddress"), building)
+        match = building is not None and (score >= 0.85 or (dist is not None and dist <= MATCH_METERS))
+        rows.append({"r": r, "dist": dist, "match": match})
+    rows.sort(key=lambda x: (not x["match"], x["dist"] if x["dist"] is not None else 1e12))
+    return rows
 
 
 def search_building(client, building, query):
-    """Search RealtyAPI, put listings at `building` first, and load the one exact match if there is one."""
-    ss.building = building
-    # Fill location from the property records now, so an unlisted building can still be estimated.
-    set_location(building)
+    """Search RealtyAPI, put listings at `building` first, and load the one match if there is one."""
     try:
         results = rl.search(client, query)
     except rl.APIError as exc:
         ss.msg = ("error", str(exc))
         return
-    if building is not None:
-        scored = sorted(((sf_address.same_building(r.get("oneLineAddress"), building), r) for r in results),
-                        key=lambda x: -x[0])
-        results = [r for _, r in scored]
-        ss.match_scores = [sc for sc, _ in scored]
-        exact = [r for sc, r in scored if sc >= 0.85]
-        if len(exact) == 1:
-            load_property(client, exact[0]["listingKey"], exact[0])
-            return
-        if not exact:
-            where = building.address
-            if results:
-                ss.results, ss.prop_idx = results, 0
-                ss.msg = ("warning", "No current listing found at {}. {} nearby listing(s) are below if one is "
-                                     "the right building; otherwise enter the features by hand (location is "
-                                     "already filled in from property records).".format(where, len(results)))
-            else:
-                ss.msg = ("warning", "No current listing found at {}. Enter the features by hand; location is "
-                                     "filled in from property records where available.".format(where))
-            return
-    else:
-        ss.match_scores = [None] * len(results)
-    if not results:
-        ss.msg = ("error", "No listings found for that address. Try the apartments.com URL instead.")
+    rows = rank_results(results, building)
+    matches = [x for x in rows if x["match"]]
+    if len(matches) == 1:
+        load_property(client, matches[0]["r"]["listingKey"], matches[0]["r"])
+        return
+    ss.results, ss.prop_idx = rows, 0
+    if matches:
+        ss.msg = ("info", "{} listings at this address. Pick the right one, then Load.".format(len(matches)))
     elif building is None:
-        # The address wasn't recognized, so never assume a result is the right building.
-        ss.results, ss.prop_idx = results, 0
-        ss.msg = ("info", "That address isn't in the SF property records. {} listing(s) found; "
-                          "load one only if it's the right building.".format(len(results)))
+        ss.msg = ("info" if rows else "error",
+                  "That address isn't in the SF property records. {} listing(s) found; load one only if it's "
+                  "the right building.".format(len(rows)) if rows else
+                  "No listings found for that text. Pick an address from the suggestions instead.")
+    elif rows:
+        ss.msg = ("warning", "No current apartments.com listing at {}. The {} listing(s) below are nearby; load "
+                             "one as a comparable, or enter the features by hand (location is already filled in "
+                             "from property records).".format(building.address, len(rows)))
     else:
-        ss.results, ss.prop_idx = results, 0
-        ss.msg = ("info", "{} listings at this address. Pick the right one, then Load.".format(len(results)))
+        ss.msg = ("warning", "No current apartments.com listing at {}. Enter the features by hand (location is "
+                             "filled in from property records), or search nearby listings below."
+                  .format(building.address))
 
 
-def on_lookup(client, index):
-    text = ss.query.strip()
+def run_lookup(client, kind, payload, term):
     reset_lookup()
-    if not text:
-        ss.msg = ("error", "Type an address first.")
-        return
-    key = rl.listing_key_from_input(text)
-    parsed = sf_address.parse(text)
-    ss.typed_unit, ss.typed_zip = parsed.unit, parsed.zip_code
-    cands = index.match(text) if index and not key else []
-    if index and not key and index.is_confident(cands):
-        ss.building = cands[0].building
-        set_location(ss.building)
+    p = sf_address.parse(term)
+    ss.typed_unit, ss.typed_zip = p.unit, p.zip_code
+    if kind == "building":
+        ss.building = payload
+        set_location(payload)
     if client is None:
-        ss.msg = ("error", "No RealtyAPI key, so listings can't be looked up. Add a key in the sidebar, or "
-                           "type the features in{}.".format(
-                               " (location is filled in from property records)" if ss.building else ""))
+        ss.msg = ("error", "No RealtyAPI key, so listings can't be looked up. Add a key in the sidebar, or type "
+                           "the features in{}.".format(" (location is filled in from property records)"
+                                                       if ss.building else ""))
         return
-    if key:
-        load_property(client, key)
-    elif ss.building is not None:
-        search_building(client, ss.building, ss.building.query)
-    elif cands:
-        ss.cands, ss.cand_idx = cands, 0
-        ss.msg = ("info", "Not sure which address you mean. Pick one, then Search.")
+    if kind == "key":
+        load_property(client, payload)
+    elif kind == "building":
+        search_building(client, payload, payload.query)
     else:
-        query = text if re.search(r"san\s*francisco|\bsf\b", text, re.I) else text + ", San Francisco, CA"
-        search_building(client, None, query)
+        search_building(client, None, as_typed_query(term))
 
 
-def on_pick_candidate(client):
-    i = ss.cand_idx
-    cands, ss.cands = ss.cands, []
-    if i < 0:
-        text = ss.query.strip()
-        query = text if re.search(r"san\s*francisco|\bsf\b", text, re.I) else text + ", San Francisco, CA"
-        search_building(client, None, query)
-    else:
-        search_building(client, cands[i].building, cands[i].building.query)
+def search_nearby(client):
+    """Listings in the building's neighborhood, nearest first (one request)."""
+    b = ss.building
+    try:
+        results = rl.search(client, "{}, San Francisco, CA".format(b.neighborhood), result_count=40)
+    except rl.APIError as exc:
+        ss.msg = ("error", str(exc))
+        return
+    ss.results, ss.prop_idx = rank_results(results, b)[:20], 0
+    ss.msg = ("info", "{} listing(s) in {}, nearest first. Load one as a comparable.".format(
+        len(results), b.neighborhood) if results else "No listings found in {}.".format(b.neighborhood))
 
 
 def on_load(client):
-    r = ss.results[ss.prop_idx]
-    ss.results = []
-    load_property(client, r["listingKey"], r)
+    load_property(client, ss.results[ss.prop_idx]["r"]["listingKey"], ss.results[ss.prop_idx]["r"])
 
 
-@st.cache_resource(show_spinner="Loading SF property records ...")
-def address_index():
-    try:
-        return sf_address.AddressIndex.load()
-    except OSError:
-        return None   # no Data/properties.csv: addresses are searched as typed
+def suggestions(index, term):
+    """Options for the address box: real SF addresses first, then the text exactly as typed."""
+    term = (term or "").strip()
+    if not term:
+        return []
+    key = rl.listing_key_from_input(term)
+    if key:
+        return [("apartments.com listing " + key, ("key", key, term))]
+    out = []
+    for c in (index.suggest(term) if index else []):
+        b = c.building
+        label = b.address + (" · " + b.facts if b.facts else "") + ("" if c.exact else " · not in property records")
+        out.append((label, ("building", b, term)))
+    out.append(("Search exactly as typed: " + term, ("typed", None, term)))
+    return out
 
 
 # ---------- sidebar ----------
@@ -253,45 +315,57 @@ with st.sidebar:
     else:
         key = st.text_input("API key", type="password", help="Not saved. Leave blank to type features in by hand.").strip()
     client = get_client(key)
-    if client:
-        st.caption("Requests used this session: {} of {}".format(client.requests, client.max_requests))
-    st.caption("A URL or listing key costs 1 request. A street address costs 2 "
-               "(search, then details). Typos are fixed against SF property records "
-               "before searching, at no cost. Repeat lookups are cached.")
+    requests_slot = st.empty()       # filled in at the end, after this run's lookups
+    st.caption("Picking an address costs 1 search request, plus 1 to load the building's units. "
+               "An apartments.com URL or listing key costs 1. Repeat lookups are cached.")
     st.divider()
-    st.caption("Model: " + rent_model.MODEL_INFO["reliability"])
-    st.caption("Trained mostly on large downtown buildings (SoMa, Tenderloin, Mission Bay). "
-               "Outer neighborhoods and 3+ bedrooms are rough.")
-    st.caption("Other features (condition, parking, views, ...) are priced from published studies, "
-               "not from SF data. See the breakdown under the estimate.")
+    st.caption("SF model: " + rent_model.MODEL_INFO["reliability"])
+    st.caption("Trained on {} units in {} buildings, weighted toward SoMa, Mission Bay and downtown; "
+               "read the warnings under each estimate.".format(rent_model.MODEL_INFO["n_used"],
+                                                               rent_model.MODEL_INFO["n_buildings"]))
+    st.caption("Features the SF model doesn't measure (condition, views, pets, ...) are priced from published "
+               "studies. See the breakdown under the estimate.")
 
-# ---------- lookup ----------
+# ---------- address ----------
 st.title("SF rent lookup")
 index = address_index()
-with st.form("lookup", border=False):
-    c1, c2 = st.columns([5, 1], vertical_alignment="bottom")
-    c1.text_input("Address", key="query", placeholder="1010 anza st #3   or an apartments.com URL")
-    c2.form_submit_button("Look up", type="primary", on_click=on_lookup, args=(client, index), width="stretch")
+if st_searchbox is not None:
+    # The box clears itself after a pick, so picking the same address again counts as a new pick.
+    pick = st_searchbox(lambda term: suggestions(index, term), key="address_box", label="Address",
+                        placeholder="Start typing an SF address, e.g. 1010 anza   (or paste an apartments.com URL)",
+                        debounce=250, clear_on_submit=True)
+    if pick is None:
+        ss.last_pick = None
+else:
+    typed = st.text_input("Address", placeholder="1010 anza st #3   or an apartments.com URL")
+    opts = suggestions(index, typed)
+    choice = st.selectbox("Matching addresses", range(len(opts)), format_func=lambda i: opts[i][0]) if opts else None
+    pick = opts[choice][1] if opts and st.button("Look up", type="primary") else None
+    ss.last_pick = None                      # every press of Look up is a new lookup
+if pick is not None and pick != ss.last_pick:
+    ss.last_pick = pick
+    run_lookup(client, *pick)
 
 if ss.msg:
     getattr(st, ss.msg[0])(ss.msg[1])
-
-if ss.cands:
-    cand_labels = {i: c.building.address + (" ({})".format(c.building.facts) if c.building.facts else "")
-                   + ("  [{}]".format("; ".join(c.notes)) if c.notes else "") for i, c in enumerate(ss.cands)}
-    cand_labels[-1] = "Search exactly as typed: " + ss.query.strip()
-    st.selectbox("Did you mean", list(cand_labels), key="cand_idx", format_func=cand_labels.__getitem__)
-    st.button("Search", on_click=on_pick_candidate, args=(client,), disabled=client is None)
-
 if ss.building is not None and ss.building.facts:
     st.caption("Property records for {}: {}".format(ss.building.address, ss.building.facts))
 
 if ss.results:
-    prop_labels = ["{}{} | {}".format("Address match | " if (sc or 0) >= 0.85 else "", r.get("name") or "",
-                                      r.get("oneLineAddress") or r["listingKey"])
-                   for r, sc in zip(ss.results, ss.match_scores or [None] * len(ss.results))]
-    st.selectbox("Property", range(len(prop_labels)), key="prop_idx", format_func=prop_labels.__getitem__)
-    st.button("Load this property", on_click=on_load, args=(client,))
+    def prop_label(i):
+        x = ss.results[i]
+        r = x["r"]
+        bits = (["This address"] if x["match"] else []) + [r.get("name") or "", r.get("oneLineAddress") or r["listingKey"]]
+        if x["dist"] is not None:
+            bits.append("{:,.0f} m away".format(x["dist"]))
+        return " | ".join(b for b in bits if b)
+    prop_labels = [prop_label(i) for i in range(len(ss.results))]
+    st.selectbox("Listings", range(len(ss.results)), key="prop_idx", format_func=prop_labels.__getitem__)
+    st.button("Load this listing", on_click=on_load, args=(client,))
+if (client is not None and ss.details is None and ss.building is not None and ss.building.neighborhood
+        and ss.building.latitude is not None and not any(x["match"] for x in ss.results)):
+    st.button("Search listings near {} (1 request)".format(ss.building.address), on_click=search_nearby,
+              args=(client,), help="Searches {} and lists results by distance.".format(ss.building.neighborhood))
 
 if ss.details is not None and ss.units:
     st.subheader("Units")
@@ -323,17 +397,25 @@ if ss.details is not None and ss.units:
 # ---------- unit form ----------
 st.subheader("Describe the unit")
 st.caption("Edit anything, then press Estimate rent. Blank or Unknown means not known: no adjustment is made.")
+PRICED_BY_MODEL = "Priced by the SF model."
+PRICED_BY_STUDIES = "Priced from published studies (see the breakdown under the estimate)."
 
 
 def select(col, key):
     label, options = fa.SELECTS[key]
-    col.selectbox(label, [fa.UNKNOWN] + options, key="s_" + key)
+    col.selectbox(label, [fa.UNKNOWN] + options, key="s_" + key,
+                  help=PRICED_BY_MODEL if key in MODEL_PRICED else PRICED_BY_STUDIES)
 
 
-def checkboxes(features):
+def checkboxes(items):
+    """items: (session key, label, help) tuples, laid out in three columns."""
     cols = st.columns(3)
-    for i, f in enumerate(features):
-        cols[i % 3].checkbox(f, key=ck(f))
+    for i, (key, label, help_text) in enumerate(items):
+        cols[i % 3].checkbox(label, key=key, help=help_text)
+
+
+def feature_items(features):
+    return [(ck(f), f, PRICED_BY_MODEL if f in MODEL_PRICED else PRICED_BY_STUDIES) for f in features]
 
 
 with st.form("unit_form"):
@@ -358,7 +440,8 @@ with st.form("unit_form"):
     c1, c2, c3 = st.columns(3)
     select(c1, "condition")
     select(c2, "parking")
-    c3.selectbox("Laundry", LAUNDRY, key="f_laundry")
+    c3.selectbox("Laundry", LAUNDRY, key="f_laundry",
+                 help=PRICED_BY_MODEL if set(MODEL_FROM_LAUNDRY) & set(MODEL_AMENITIES) else None)
     c1, c2, c3 = st.columns(3)
     select(c1, "pets")
     select(c2, "utilities")
@@ -368,20 +451,40 @@ with st.form("unit_form"):
 
     st.markdown("**Unit features**")
     st.toggle("Unticked means the unit doesn't have it", key="f_unticked_no",
-              help="On: a missing feature that most training buildings have lowers the estimate a little. "
+              help="On: a missing feature that many training buildings have lowers the estimate a little. "
                    "Off: unticked boxes are treated as unknown. Turned on automatically when the listing "
                    "includes an amenity list.")
-    checkboxes(fa.UNIT_FEATURES)
+    checkboxes(feature_items(fa.UNIT_FEATURES))
     st.markdown("**Building amenities**")
-    checkboxes([DOORMAN] + fa.BUILDING_FEATURES)
+    checkboxes(feature_items(fa.BUILDING_FEATURES)
+               + [(mk(m), EXTRA_LABELS.get(m, m.replace("_", " ").capitalize()), PRICED_BY_MODEL) for m in EXTRA_MODEL])
 
     estimate_clicked = st.form_submit_button("Estimate rent", type="primary")
 
 mapped = {fa._norm(a) for aliases in fa.AMENITY_NAMES.values() for a in aliases}
-mapped |= {fa._norm(t) for ts in rl.MODEL_AMENITIES.values() for t in ts}
+mapped |= {fa._norm(t) for m in MODEL_AMENITIES for t in rl.AMENITY_GROUPS.get(m, [m.replace("_", " ")])}
+mapped |= {fa._norm(t) for m in MODEL_FROM_LAUNDRY for t in rl.AMENITY_GROUPS[m]}
 other = [n for n in ss.amen_names if fa._norm(n) not in mapped]
 if other:
     st.caption("Other advertised amenities (not priced): " + ", ".join(other))
+
+
+def model_amenity_inputs():
+    """rent_model amenity inputs from the form: True, False, or None for unknown."""
+    def box(key):
+        return True if ss[key] else (False if ss.f_unticked_no else None)
+    out = {}
+    for m in MODEL_AMENITIES:
+        if m in MODEL_FROM_LAUNDRY:
+            out[m] = None if ss.f_laundry == fa.UNKNOWN else ss.f_laundry == MODEL_FROM_LAUNDRY[m]
+        elif m in MODEL_FROM_SELECT:
+            v = ss["s_" + MODEL_FROM_SELECT[m]]
+            out[m] = None if v == fa.UNKNOWN else (v in GARAGE if m == "parking" else v != "None")
+        elif m in MODEL_FROM_CHECKBOX:
+            out[m] = box(ck(MODEL_FROM_CHECKBOX[m]))
+        else:
+            out[m] = box(mk(m))
+    return out
 
 
 def run_estimate():
@@ -390,21 +493,19 @@ def run_estimate():
     if (lat is None) != (lon is None):
         notes.append("Latitude and longitude are only used together; distance to downtown was taken from the zip.")
         lat = lon = None
-    laundry = ss.f_laundry
+    amenities = model_amenity_inputs()
     model = rent_model.predict_rent(
         bedrooms=ss.f_beds, bathrooms=ss.f_baths, sqft=ss.f_sqft, zip_code=ss.f_zip.strip() or None,
-        latitude=lat, longitude=lon,
-        amenities={"in_unit_laundry": None if laundry == fa.UNKNOWN else laundry == "In-unit washer and dryer",
-                   "shared_laundry": None if laundry == fa.UNKNOWN else laundry == "Shared in building",
-                   "doorman_concierge": ss[ck(DOORMAN)]})
+        latitude=lat, longitude=lon, amenities=amenities)
     choices = {k: ss["s_" + k] for k in fa.SELECTS}
     choices["floor"] = ss.f_floor
-    choices["features"] = {f for f in fa.UNIT_FEATURES + fa.BUILDING_FEATURES if ss[ck(f)]}
+    choices["features"] = {f for f in CHECKS if ss[ck(f)]}
     choices["unticked_means_no"] = ss.f_unticked_no
+    choices["skip"] = MODEL_PRICED
     adj = fa.adjust(model["estimate"], choices)
     i = ss.unit_idx
     listed = ss.units[i].get("rent") if ss.details is not None and 0 <= i < len(ss.units) else None
-    return {"model": model, "adj": adj, "listed": listed, "notes": notes}
+    return {"model": model, "adj": adj, "listed": listed, "notes": notes, "amenities": amenities}
 
 
 if estimate_clicked:
@@ -433,8 +534,15 @@ else:
 
     st.markdown("**How we got there**")
     money = lambda x, signed=False: ("{}${:,.0f}".format(("+" if x >= 0 else "-") if signed else "", abs(x)))
-    rows = [{"Factor": "Model estimate", "Amount": money(model["estimate"]),
-             "Why": "Size, location, laundry and doorman, fit on SF listings. " + model["reliability"][:1].upper() + model["reliability"][1:] + "."}]
+    amen = ss.result["amenities"]
+    has = [m.replace("_", " ") for m, v in amen.items() if v]
+    unknown = [m.replace("_", " ") for m, v in amen.items() if v is None]
+    why = "Size, location and the amenities the SF model prices. With: {}.".format(", ".join(has) or "none")
+    if unknown:
+        why += " Unknown (typical share assumed): {}.".format(", ".join(unknown))
+    rel = model["reliability"]
+    rows = [{"Factor": "SF model estimate", "Amount": money(model["estimate"]),
+             "Why": why + " " + rel[:1].upper() + rel[1:] + "."}]
     lacking = [r for r in adj["rows"] if r["detail"].startswith("Doesn't have it")]
     for r in adj["rows"]:
         if r in lacking:
@@ -446,18 +554,18 @@ else:
         rows.append({"Factor": "Missing common features", "Amount": money(sum(r["dollars"] for r in lacking), signed=True),
                      "Why": "Features many training buildings advertise, scaled by how common each is: " + "; ".join(
                          "{} {}".format(r["factor"].lower(), money(r["dollars"], signed=True)) for r in lacking) + "."})
-    rows.append({"Factor": "Estimated rent", "Amount": money(est), "Why": "Model estimate plus adjustments."})
+    rows.append({"Factor": "Estimated rent", "Amount": money(est), "Why": "SF model estimate plus adjustments."})
     # Table cells are markdown too: escape "$" so pairs of dollar amounts don't render as math.
     st.table(pd.DataFrame(rows).set_index("Factor").map(lambda t: t.replace("$", "\\$")))
     if not adj["rows"]:
-        st.caption("No feature adjustments: every feature is Unknown, unchecked, or the same as the typical "
-                   "building the model was trained on.")
+        st.caption("No study-based adjustments: every other feature is Unknown, unchecked, or the same as the "
+                   "typical building the model was trained on.")
     sources = {}
     for r in adj["rows"]:
         for src in r["sources"]:
             sources.setdefault(src["url"] or src["title"], src)
     if sources:
-        with st.expander("Sources for the feature adjustments"):
+        with st.expander("Sources for the study-based adjustments"):
             for src in sources.values():
                 title = "[{}]({})".format(src["title"], src["url"]) if src.get("url") else src["title"]
                 st.markdown("- {}, {} ({})".format(src["name"], title, src["year"] or "undated"))
@@ -468,6 +576,15 @@ else:
     if model["warnings"]:
         st.warning("\n".join("- " + w for w in model["warnings"]))
 
+# ---------- diagnostics ----------
+if client is not None:
+    requests_slot.caption("Requests used this session: {} of {}".format(client.requests, client.max_requests))
+if client is not None and client.log:
+    with st.expander("RealtyAPI requests this session"):
+        st.caption("What was sent to RealtyAPI and what came back (newest first). If a lookup finds nothing, "
+                   "this shows whether the request failed or the search returned no listings.")
+        st.code("\n".join("{} {} -> {}".format(e["endpoint"], json.dumps(e["params"]), e["result"])
+                          for e in reversed(client.log[-15:])), language=None)
 if ss.details is not None:
     with st.expander("Raw response (for checking fields)"):
         st.code("\n".join("{} = {}".format(p, json.dumps(v)[:200]) for p, v in rl.leaves(ss.details)), language=None)

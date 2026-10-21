@@ -38,15 +38,14 @@ UNIT_KEYS = {
     "available": ["availableDate", "availability", "availabilityDate", "dateAvailable", "available"],
 }
 
-# Advertised amenity names -> model amenities, as coded in train_rent_model.AMENITY_GROUPS.
-# Names are compared after lowercasing and dropping punctuation ("Washer/Dryer" = "washer dryer").
-MODEL_AMENITIES = {
-    "in_unit_laundry": ["Washer Dryer", "Washer Dryer In Unit", "In Unit Washer Dryer"],
-    "shared_laundry": ["Laundry Facilities"],
-    "doorman_concierge": ["Doorman", "Concierge"],
+# How train_rent_model turns advertised amenity names into model variables: these groups
+# (train_rent_model.AMENITY_GROUPS), plus one variable per other name, lowercased with punctuation
+# and spaces turned into underscores ("Tennis Court" -> tennis_court).
+AMENITY_GROUPS = {
+    "in_unit_laundry": ["washer dryer"], "shared_laundry": ["laundry facilities"],
+    "parking": ["parking", "garage parking"], "balcony_patio": ["balcony", "patio"],
+    "doorman_concierge": ["doorman", "concierge"],
 }
-AMENITY_LABELS = {"in_unit_laundry": "In-unit laundry", "shared_laundry": "Shared laundry",
-                  "doorman_concierge": "Doorman / concierge"}
 
 
 class APIError(Exception):
@@ -62,32 +61,77 @@ class Client:
         self.timeout = timeout
         self.requests = 0
         self.cache = {}
+        self.log = []      # one entry per call: what was asked and what came back (no key)
 
     def get(self, endpoint, params):
         cache_key = (endpoint, tuple(sorted(params.items())))
+        entry = {"endpoint": endpoint, "params": dict(params), "result": ""}
+        self.log.append(entry)
         if cache_key in self.cache:
+            entry["result"] = "cached: " + _summary(self.cache[cache_key])
             return self.cache[cache_key]
         if self.requests >= self.max_requests:
+            entry["result"] = "not sent: request cap reached"
             raise APIError("Request cap ({}) reached for this session.".format(self.max_requests))
         self.requests += 1
         req = Request(BASE_URL + endpoint + "?" + urlencode(params),
                       headers={"x-realtyapi-key": self.key, "Accept": "application/json"})
         try:
-            with urlopen(req, timeout=self.timeout) as response:
-                data = json.load(response)
-        except HTTPError as exc:
-            # Do not show response bodies or headers that could contain credentials.
-            raise APIError("HTTP {} on {}".format(exc.code, endpoint)) from None
-        except (URLError, TimeoutError, OSError, ValueError):
-            raise APIError("Network timeout, connection failure, or invalid JSON on " + endpoint) from None
-        if not isinstance(data, dict):
-            raise APIError("Unexpected response format on " + endpoint)
-        message = str(data.get("message", ""))
-        if message and not message.lower().startswith("success"):
-            raise APIError("API did not report success on {}: {}".format(endpoint, message[:200]))
+            try:
+                with urlopen(req, timeout=self.timeout) as response:
+                    data = json.load(response)
+            except HTTPError as exc:
+                # Do not show response bodies or headers that could contain credentials.
+                raise APIError("HTTP {} on {}".format(exc.code, endpoint)) from None
+            except (URLError, TimeoutError, OSError, ValueError):
+                raise APIError("Network timeout, connection failure, or invalid JSON on " + endpoint) from None
+            if not isinstance(data, dict):
+                raise APIError("Unexpected response format on " + endpoint)
+            message = str(data.get("message", ""))
+            if message and not message.lower().startswith("success"):
+                raise APIError("API did not report success on {}: {}".format(endpoint, message[:200]))
+        except APIError as exc:
+            entry["result"] = "error: " + str(exc)
+            raise
+        entry["result"] = "ok: " + _summary(data)
         time.sleep(0.15)
         self.cache[cache_key] = data
         return data
+
+
+def _summary(data):
+    """One line describing a response: its top-level keys and how many listings it holds."""
+    listings = _listing_list(data)
+    keys = ", ".join(list(data)[:8]) if isinstance(data, dict) else type(data).__name__
+    return "keys [{}]{}".format(keys, "; {} listing(s)".format(len(listings)) if listings is not None else "")
+
+
+def _listing_list(node, depth=0):
+    """The first list of objects with a listingKey anywhere in a response, or None."""
+    if depth > 4:
+        return None
+    if isinstance(node, list):
+        if node and all(isinstance(x, dict) and x.get("listingKey") for x in node[:3]):
+            return node
+        items = node
+    elif isinstance(node, dict):
+        items = node.values()
+    else:
+        return None
+    for v in items:
+        found = _listing_list(v, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def distance_m(lat1, lon1, lat2, lon2):
+    """Approximate distance in meters (fine at city scale)."""
+    if None in (lat1, lon1, lat2, lon2):
+        return None
+    dy = (lat1 - lat2) * 111_000
+    dx = (lon1 - lon2) * 111_000 * math.cos(math.radians((lat1 + lat2) / 2))
+    return math.hypot(dx, dy)
 
 
 # ---------- parsing ----------
@@ -240,17 +284,15 @@ def _norm(s):
     return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
 
 
-def model_amenities(names):
-    """Map advertised amenity names to model inputs: True/False, or None if no amenity data at all.
+def model_amenities(names, model_names):
+    """Map advertised amenity names to rent_model amenity inputs: True/False, or None if no amenity data.
 
     The model was trained with "not listed" coded as no, so when a listing has an amenity list,
     a model amenity missing from it is set to False.
     """
     have = {_norm(n) for n in names}
-    out = {}
-    for model_name, tokens in MODEL_AMENITIES.items():
-        out[model_name] = (any(_norm(t) in have for t in tokens)) if names else None
-    return out
+    return {m: (any(_norm(t) in have for t in AMENITY_GROUPS.get(m, [m.replace("_", " ")])) if names else None)
+            for m in model_names}
 
 
 def property_summary(search_result, details):
@@ -302,12 +344,20 @@ def leaves(value, path="$"):
 
 # ---------- lookup ----------
 
-def search(client, address):
-    """Return search results (property dicts with listingKey) for an address."""
-    data = client.get("/search/bylocation", {"location": address, "page": 1, "resultCount": SEARCH_RESULTS})
+def search(client, location, result_count=SEARCH_RESULTS):
+    """Return search results (property dicts with listingKey) for an address, neighborhood or zip.
+
+    apartments.com resolves `location` with its typeahead and searches that area, so an address
+    can return nearby buildings as well as (or instead of) the building itself.
+    """
+    data = client.get("/search/bylocation", {"location": location, "page": 1, "resultCount": result_count})
     results = data.get("searchResults")
     if not isinstance(results, list):
-        raise APIError("Search response is missing searchResults")
+        results = _listing_list(data)
+    if results is None:
+        if data.get("searchResults") is None and any(k in data for k in ("total", "nextPage")):
+            return []
+        raise APIError("Search response has no listings (top-level keys: {})".format(", ".join(list(data)[:10])))
     return [r for r in results if isinstance(r, dict) and r.get("listingKey")]
 
 
