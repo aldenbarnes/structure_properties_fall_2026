@@ -25,14 +25,25 @@ Two kinds of input are recognised automatically:
      estimated only if at least 5 comps have it and 5 do not, and the output
      rent_model.py carries wide-interval warnings. Needs scikit-learn.
 
-  3. A RealtyAPI training file with one row per available unit (recognised by
+  3. One or more unit-level files (several are pooled, see below). A RealtyAPI training file with one row per available unit (recognised by
      the columns rent, beds, baths, sqft, zip_code, amenities, listing_key;
      latitude, longitude and weight are used when present). Fits a lasso on
      log rent with beds, baths, log(sqft) and distance to downtown left
      unpenalized and zip effects and building-level amenities penalized. The
      penalty comes from cross-validation that holds out whole buildings
      (units in one building are not independent), and the reported error is
-     measured the same way, re-choosing the penalty inside every fold. Everything from here on describes input type 1.
+     measured the same way, re-choosing the penalty inside every fold. It also
+     sets 20% of the buildings aside as a test set, fits on the rest, and
+     reports the test RMSE (the final model is then refit on everything).
+
+     Pooling:  python train_rent_model.py new_units.csv old_units.csv comps.csv listings.xlsx
+     Files are read in the order given and an earlier file wins whenever the same
+     unit (listing_key + unit_key) or floor plan appears again, so nothing is
+     counted twice. Spreadsheet listings at an address already covered by a unit
+     file are skipped; the rest are added as extra buildings with an unknown
+     amenity list (treated as a typical building, never as 'no'). Amenities named
+     only in the comps file are ignored so a naming difference cannot read as
+     'not offered'. Everything from here on describes input type 1.
 
 What it does:
   1. Cleans the listings (rules printed at run time and saved in the output file).
@@ -50,6 +61,7 @@ import datetime
 import itertools
 import math
 import pprint
+import re
 import sys
 
 import numpy as np
@@ -891,13 +903,16 @@ def report_comps(p, steps):
 
 
 # =====================================================================================
-# Input type 3: RealtyAPI training file, one row per available unit
-# (columns rent, beds, baths, sqft, zip_code, latitude, longitude, amenities,
-#  listing_key and optionally weight). Lasso with cross-validation that holds out
-# whole buildings.
+# Input type 3: unit-level training data (one row per available unit), from one file or
+# several files pooled. A RealtyAPI training file has the columns rent, beds, baths,
+# sqft, zip_code, latitude, longitude, amenities, listing_key (and unit_key). Lasso
+# with cross-validation that holds out whole buildings, plus a building-grouped
+# train/test split that reports RMSE.
 # =====================================================================================
 UNITS_REQUIRED = {"rent", "beds", "baths", "sqft", "zip_code", "amenities", "listing_key"}
 MIN_SQFT = 200            # smaller rows are shared-living rooms / non-standard units
+MAX_BEDS = 4              # larger homes are too few to model
+OUT_OF_SCOPE_TYPES = {"house", "single family", "single-family home", "townhouse", "multi-family"}
 MIN_ZIP_BUILDINGS = 3     # zips with fewer buildings are pooled into "zip_other"
 MIN_AMEN_BUILDINGS = 5    # an amenity needs this many buildings with it and without it
 CBD_LAT, CBD_LON = 37.788, -122.407   # Union Square, for the distance-to-downtown variable
@@ -906,10 +921,12 @@ RATIOS = np.geomspace(1.0, 1e-3, 60)  # penalty as a fraction of the smallest pe
 CV_REPEATS = 3            # repeats of the outer (error-measuring) cross-validation
 SELECT_REPEATS = 20       # repeats of 10-fold CV used to choose the final penalty (the curve is flat and noisy)
 INNER_REPEATS = 2         # repeats of 5-fold CV for the penalty inside each outer fold
+HOLDOUT_FRACTION = 0.20   # share of buildings set aside as the test set
+HOLDOUT_SEED = 42
 AMENITY_GROUPS = {
-    "in_unit_laundry": ["Washer Dryer"], "shared_laundry": ["Laundry Facilities"],
-    "parking": ["Parking", "Garage Parking"], "balcony_patio": ["Balcony", "Patio"],
-    "doorman_concierge": ["Doorman", "Concierge"],
+    "in_unit_laundry": ["washer dryer"], "shared_laundry": ["laundry facilities"],
+    "parking": ["parking", "garage parking"], "balcony_patio": ["balcony", "patio"],
+    "doorman_concierge": ["doorman", "concierge"],
 }
 
 
@@ -918,11 +935,161 @@ def _dist_km(lat, lon):
                     (np.asarray(lon, float) - CBD_LON) * 111.0 * math.cos(math.radians(37.8)))
 
 
+def _norm_addr(a):
+    a = str(a).lower().split(", san francisco")[0]
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", a)).strip()
+
+
+def _bkey(address, zip_code):
+    """Building key that survives address-range formatting: first street number, first street
+    word and zip ('1080-1084 Folsom St' and '1080 Folsom St' give the same key)."""
+    a = _norm_addr(address)
+    m = re.match(r"(\d+)(?:\s+\d+)*\s+([a-z]+)", a)
+    z = re.search(r"(\d{5})", str(zip_code))
+    return (m.group(1), m.group(2), z.group(1) if z else None) if m else None
+
+
+def _tok(s):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", str(s).lower().replace("/", " ").replace("-", " "))).strip()
+
+
+def _tokens(s):
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return set()
+    return {t for t in (_tok(x) for x in str(s).split(";")) if t}
+
+
+# ---- pooling several files into one unit-level table ---------------------------------
+POOL_COLS = ["listing_key", "unit_key", "floor_plan", "rent", "beds", "baths", "sqft", "zip_code",
+             "latitude", "longitude", "amenities", "property_type", "address"]
+
+
+def _source_kind(df, path):
+    cols = set(df.columns)
+    if "asking_rent_usd_month" in cols:
+        return "comps"
+    if UNITS_REQUIRED <= cols:
+        return "units"
+    if "Rent Price ($)" in cols:
+        return "listings"
+    sys.exit(f"{path}: not a recognised training file (needs a rent column and either the unit-level "
+             f"columns {sorted(UNITS_REQUIRED)}, the comps columns, or the listings spreadsheet columns).")
+
+
+def _adapt(df, kind):
+    """Map one file to POOL_COLS (+ amen_known). Returns (frame, rows_dropped_inside_file)."""
+    inner = 0
+    if kind == "units":
+        o = pd.DataFrame({c: df[c] if c in df else np.nan for c in POOL_COLS})
+    elif kind == "comps":
+        d = df
+        if "comp_use" in d:
+            d = d[d["comp_use"].astype(str).str.strip().str.lower() != "exclude"]
+            inner = len(df) - len(d)
+        pt = d["property_type_api"].astype(str).str.contains("Single-Family", na=False)
+        o = pd.DataFrame({"listing_key": d["listing_key"], "unit_key": d["unit_key"], "floor_plan": np.nan,
+                          "rent": d["asking_rent_usd_month"], "beds": d["beds"], "baths": d["baths"],
+                          "sqft": d["sqft"], "zip_code": d["zip_code"], "latitude": d["latitude"],
+                          "longitude": d["longitude"], "amenities": d["amenities_api"],
+                          "property_type": np.where(pt, "House", "Apartment"), "address": d["address"]})
+    else:  # listings spreadsheet
+        key = ["Formatted Address", "Rent Price ($)", "Bedrooms", "Bathrooms", "Square Footage", "Listed Date"]
+        d = df.drop_duplicates([c for c in key if c in df.columns])
+        inner = len(df) - len(d)
+        o = pd.DataFrame({"listing_key": np.nan, "unit_key": np.nan, "floor_plan": np.nan,
+                          "rent": d["Rent Price ($)"], "beds": d["Bedrooms"], "baths": d["Bathrooms"],
+                          "sqft": d["Square Footage"], "zip_code": d["Zip Code"], "latitude": np.nan,
+                          "longitude": np.nan, "amenities": np.nan, "property_type": d["Property Type"],
+                          "address": d["Formatted Address"]})
+    o = o.reset_index(drop=True)
+    o["amen_known"] = o["amenities"].notna() & (o["amenities"].astype(str).str.strip() != "")
+    return o, inner
+
+
+def load_pool(paths):
+    """Read several training files (newest / most trusted first) and pool them without
+    double counting. Returns (pooled frame, steps, per-file summary)."""
+    items = []
+    for p in paths:
+        df = read_table(p)
+        kind = _source_kind(df, p)
+        o, inner = _adapt(df, kind)
+        name = p.replace("\\", "/").split("/")[-1]
+        o["source"] = name
+        items.append(dict(name=name, kind=kind, frame=o, rows=len(df), inner=inner))
+    if not any(i["kind"] == "units" for i in items):
+        sys.exit("Pooling needs at least one unit-level RealtyAPI training file to define the amenity vocabulary.")
+    vocab = set()
+    for i in items:
+        if i["kind"] == "units":
+            for s in i["frame"]["amenities"]:
+                vocab |= _tokens(s)
+    steps = []
+    for i in items:
+        if i["inner"]:
+            steps.append((f"{i['name']}: rows excluded or repeated inside the file "
+                          f"(comp_use 'Exclude' or an identical repeated listing)", i["inner"]))
+        if i["kind"] != "units":
+            # keep only amenities that the unit-level files also use, so that an amenity named
+            # differently in this file can never be mistaken for "not offered" elsewhere
+            i["frame"]["amenities"] = i["frame"]["amenities"].map(
+                lambda s: "; ".join(sorted(_tokens(s) & vocab)) if isinstance(s, str) else s)
+    addr_key, bkey_key, unit_sig = {}, {}, set()
+    for i in items:
+        f = i["frame"]
+        for a, z, k in zip(f["address"], f["zip_code"], f["listing_key"]):
+            if isinstance(k, str):
+                addr_key.setdefault(_norm_addr(a), k)
+                bkey_key.setdefault(_bkey(a, z), k)
+        for z, b, ba, sq, r_ in zip(f["zip_code"], f["beds"], f["baths"], f["sqft"], f["rent"]):
+            unit_sig.add((str(z)[:5], b, ba, sq, r_))
+    pooled = []
+    for i in items:
+        f = i["frame"].copy()
+        if f["listing_key"].isna().all():
+            na = f["address"].map(_norm_addr)
+            mapped = na.map(addr_key)
+            bk = pd.Series([_bkey(a, z) for a, z in zip(f["address"], f["zip_code"])], index=f.index)
+            mapped = mapped.where(mapped.notna(), bk.map(lambda x: bkey_key.get(x) if x is not None else None))
+            covered = mapped.notna()
+            if covered.sum():
+                steps.append((f"{i['name']}: listings at a building already covered by the unit-level files "
+                              f"(same street number, street and zip, so counting them again would double count)",
+                              int(covered.sum())))
+            f = f[~covered].copy()
+            same = pd.Series([(str(z)[:5], b, ba, sq, r_) in unit_sig for z, b, ba, sq, r_ in
+                              zip(f["zip_code"], f["beds"], f["baths"], f["sqft"], f["rent"])], index=f.index)
+            if same.sum():
+                steps.append((f"{i['name']}: listings with the same zip, beds, baths, sqft and rent as a unit already "
+                              f"in the unit-level files (probable repeat under a different address)", int(same.sum())))
+            f = f[~same].copy()
+            f["listing_key"] = "addr:" + na[f.index]
+        pooled.append(f)
+    pool = pd.concat(pooled, ignore_index=True)
+    before = pool["source"].value_counts()
+    has_unit = pool["unit_key"].notna()
+    dup_unit = has_unit & pool.duplicated(["listing_key", "unit_key"], keep="first")
+    plan = pool["unit_key"].isna() & pool["floor_plan"].notna()
+    dup_plan = plan & pool.duplicated(["listing_key", "floor_plan", "beds", "baths", "sqft"], keep="first")
+    for mask, label in ((dup_unit, "the same unit (listing_key + unit_key) already in an earlier file"),
+                        (dup_plan, "the same floor plan (building + plan + beds + baths + sqft) already in an earlier file")):
+        for src, n in pool[mask]["source"].value_counts().items():
+            steps.append((f"{src}: {label}", int(n)))
+    pool = pool[~(dup_unit | dup_plan)].reset_index(drop=True)
+    summary = [dict(file=i["name"], kind=i["kind"], rows_read=i["rows"], rows_after_dedup=int((pool["source"] == i["name"]).sum()))
+               for i in items]
+    return pool, steps, summary
+
+
 def clean_units(raw):
     d = raw.copy()
     steps = []
     for c in ("rent", "beds", "baths", "sqft"):
         d[c] = pd.to_numeric(d[c], errors="coerce")
+    if "source" not in d:
+        d["source"] = "file"
+    if "amen_known" not in d:
+        d["amen_known"] = d["amenities"].notna() & (d["amenities"].astype(str).str.strip() != "")
 
     def step(name, keep):
         nonlocal d
@@ -936,10 +1103,18 @@ def clean_units(raw):
     d["zip_code"] = d["zip_code"].astype(str).str.extract(r"(\d{5})", expand=False)
     step("missing rent, bedrooms, bathrooms or zip code",
          lambda x: x.rent.notna() & x.baths.notna() & x.beds.notna() & x.zip_code.notna())
+    step("outside San Francisco (zip code not 941xx)", lambda x: x.zip_code.str.startswith("941"))
+    if "property_type" in d:
+        step("houses and townhouses (single-family market, not multifamily apartments)",
+             lambda x: ~x["property_type"].astype(str).str.strip().str.lower().isin(OUT_OF_SCOPE_TYPES))
+    step(f"more than {MAX_BEDS} bedrooms (too few to model; includes room-by-room listings)", lambda x: x.beds <= MAX_BEDS)
     step("missing square footage (a size-controlled model cannot use them)", lambda x: x.sqft.notna())
     step(f"under {MIN_SQFT} sq ft (shared-living rooms and other non-standard units)", lambda x: x.sqft >= MIN_SQFT)
     d = d.reset_index(drop=True)
-    w = pd.to_numeric(d["weight"], errors="coerce") if "weight" in d else pd.Series(np.nan, index=d.index)
+    if "weight" in raw and "source" not in raw:
+        w = pd.to_numeric(d["weight"], errors="coerce")
+    else:
+        w = pd.Series(np.nan, index=d.index)
     w = w.fillna(1.0 / d.groupby("listing_key")["rent"].transform("size"))
     d["w"] = w / w.groupby(d["listing_key"]).transform("sum")   # every building counts as 1 in total
     return d, steps
@@ -948,24 +1123,29 @@ def clean_units(raw):
 def _units_design(d):
     """Core variables, penalized variables (zip effects + amenities) and the metadata
     the prediction function needs."""
-    toks = d["amenities"].fillna("").map(lambda s: {x.strip() for x in str(s).split(";") if x.strip()})
+    toks = d["amenities"].map(_tokens)
+    known = d["amen_known"].values.astype(bool)
     grouped = {t for v in AMENITY_GROUPS.values() for t in v}
     A = {}
     for k, v in AMENITY_GROUPS.items():
         A[k] = toks.map(lambda s, v=v: float(bool(s & set(v))))
-    for t in sorted({t for s in toks for t in s} - grouped):
-        A[t.lower().replace(" ", "_")] = toks.map(lambda s, t=t: float(t in s))
+    for t in sorted({t for s, kn in zip(toks, known) if kn for t in s} - grouped):
+        A[t.replace(" ", "_")] = toks.map(lambda s, t=t: float(t in s))
     A = pd.DataFrame(A, index=d.index)
     bld = d["listing_key"]
     keep, skipped = [], []
     for c in A:
-        per = A[c].groupby(bld).max()
+        per = A.loc[known, c].groupby(bld[known]).max()
         n_yes, n_no = int((per == 1).sum()), int((per == 0).sum())
         if n_yes >= MIN_AMEN_BUILDINGS and n_no >= MIN_AMEN_BUILDINGS:
             keep.append(c)
         else:
             skipped.append(f"{c} ({n_yes} buildings with, {n_no} without)")
-    A = A[keep]
+    A = A[keep].copy()
+    per_bld = A[known].groupby(bld[known]).max()
+    shares = {c: float(per_bld[c].mean()) for c in A.columns}
+    for c in A.columns:                      # unknown amenity list: neutral (typical building), never "no"
+        A.loc[~known, c] = shares[c]
 
     zb = d.groupby("zip_code")["listing_key"].nunique()
     zgroups = sorted(str(z) for z in zb[zb >= MIN_ZIP_BUILDINGS].index)
@@ -980,12 +1160,10 @@ def _units_design(d):
     core = pd.DataFrame({"beds": d["beds"], "baths": d["baths"], "log_sqft": np.log(d["sqft"]),
                          "dist_km": dist})
     pen = pd.concat([Z, A], axis=1)
-    per_bld = A.groupby(bld).max()
-    meta = dict(amenities=list(A.columns), skipped=skipped, zip_groups=zgroups,
-                shares={c: float(per_bld[c].mean()) for c in A.columns},
+    meta = dict(amenities=list(A.columns), skipped=skipped, zip_groups=zgroups, shares=shares,
                 zip_dist={str(z): round(float(v), 3) for z, v in dist.groupby(d["zip_code"]).mean().items()},
                 beds_counts={str(int(b)): int(n) for b, n in d["beds"].round().value_counts().sort_index().items()},
-                n_buildings=int(bld.nunique()))
+                n_buildings=int(bld.nunique()), n_amen_unknown=int((~known).sum()))
     return core, pen, meta
 
 
@@ -1038,11 +1216,34 @@ def _u_cv_curve(C, P, y, w, groups, k, reps, seed):
     return err / tot
 
 
+def _metrics(pred, act, w):
+    """Error measures for predicted vs actual rent in dollars (pred, act are arrays)."""
+    e = pred - act
+    ae = np.abs(e)
+    res = np.log(act) - np.log(pred)
+    lg = np.log(act)
+    return dict(rmse=float(np.sqrt(np.mean(e ** 2))), mae=float(ae.mean()), mape=float((ae / act).mean() * 100),
+                r2=float(1 - np.sum(e ** 2) / np.sum((act - act.mean()) ** 2)),
+                rmse_log=float(np.sqrt(np.mean(res ** 2))),
+                r2_log=float(1 - np.sum(res ** 2) / np.sum((lg - lg.mean()) ** 2)),
+                w_rmse=float(np.sqrt(np.average(e ** 2, weights=w))), w_mae=float(np.average(ae, weights=w)),
+                w_mape=float(np.average(ae / act, weights=w) * 100))
+
+
+def _u_fit_predict(C, P, y, w, tr, te, j):
+    """Fit on rows `tr` at penalty index j and return dollar predictions for rows `te`."""
+    beta, gam = _u_path(C[tr], P[tr], y[tr], w[tr], RATIOS[[j]])
+    fit_tr = _u_predict(C[tr], P[tr], beta, gam)[:, 0]
+    smear = float(np.average(np.exp(y[tr] - fit_tr), weights=w[tr]))
+    return np.exp(_u_predict(C[te], P[te], beta, gam)[:, 0]) * smear
+
+
 def _u_outer_cv(C, P, y, w, groups, raw_w):
     """Honest out-of-building predictions: in every outer fold the penalty is re-chosen
     on that fold's training buildings only, so the selection step is inside the test."""
     act = np.exp(y)
     out = dict(lasso=[], core=[], median=[], log_res=[], ratios=[])
+    P0 = P[:, :0]
     for r in range(CV_REPEATS):
         f = _u_folds(groups, 10, 1000 + r)
         pl, pc, pm = np.zeros(len(y)), np.zeros(len(y)), np.zeros(len(y))
@@ -1051,31 +1252,41 @@ def _u_outer_cv(C, P, y, w, groups, raw_w):
             e = _u_cv_curve(C[tr], P[tr], y[tr], w[tr], groups[tr], 5, INNER_REPEATS, 10 * r + i)
             j = int(np.argmin(e))
             out["ratios"].append(float(RATIOS[j]))
-            for P_, ratio_idx, target in ((P, j, pl), (P[:, :0], 0, pc)):
-                beta, gam = _u_path(C[tr], P_[tr], y[tr], w[tr], RATIOS[[ratio_idx]])
-                fit_tr = _u_predict(C[tr], P_[tr], beta, gam)[:, 0]
-                smear = float(np.average(np.exp(y[tr] - fit_tr), weights=w[tr]))
-                target[te] = np.exp(_u_predict(C[te], P_[te], beta, gam)[:, 0]) * smear
+            pl[te] = _u_fit_predict(C, P, y, w, tr, te, j)
+            pc[te] = _u_fit_predict(C, P0, y, w, tr, te, 0)
             pm[te] = np.median(act[tr])
         out["lasso"].append(pl)
         out["core"].append(pc)
         out["median"].append(pm)
         out["log_res"].append(y - np.log(pl))
-    def score(preds):
-        rows = []
-        for p in preds:
-            e = np.abs(p - act)
-            rows.append((np.average(e, weights=raw_w), np.average(e / act, weights=raw_w) * 100,
-                         e.mean(), (e / act).mean() * 100))
-        return [float(v) for v in np.mean(rows, axis=0)]
-    out["scores"] = {k: score(out[k]) for k in ("lasso", "core", "median")}
-    sst = float(np.sum((y - y.mean()) ** 2))
-    out["cv_r2"] = float(np.mean([1 - np.sum(r ** 2) / sst for r in out["log_res"]]))
+    avg = lambda L: {k: float(np.mean([_metrics(p, act, raw_w)[k] for p in L])) for k in _metrics(L[0], act, raw_w)}  # noqa: E731
+    out["scores"] = {k: avg(out[k]) for k in ("lasso", "core", "median")}
+    out["cv_r2"] = out["scores"]["lasso"]["r2_log"]
     return out
 
 
-def fit_units(raw, source_label, penalty_fraction=None):
+def _u_holdout(C, P, y, w, groups, raw_w):
+    """One train/test split, by building: the penalty is chosen by cross-validation on the
+    training buildings only, and the test buildings are scored once."""
+    ub = np.unique(groups)
+    np.random.default_rng(HOLDOUT_SEED).shuffle(ub)
+    n_test = max(1, int(round(len(ub) * HOLDOUT_FRACTION)))
+    te = np.isin(groups, ub[:n_test])
+    tr = ~te
+    curve = np.mean([_u_cv_curve(C[tr], P[tr], y[tr], w[tr], groups[tr], 10, 1, 700 + s) for s in range(10)], axis=0)
+    j = int(np.argmin(curve))
+    act = np.exp(y[te])
+    res = dict(n_train_units=int(tr.sum()), n_test_units=int(te.sum()), n_train_buildings=int(len(ub) - n_test),
+               n_test_buildings=int(n_test), penalty_fraction_of_max=round(float(RATIOS[j]), 4))
+    res["lasso"] = _metrics(_u_fit_predict(C, P, y, w, tr, te, j), act, raw_w[te])
+    res["core"] = _metrics(_u_fit_predict(C, P[:, :0], y, w, tr, te, 0), act, raw_w[te])
+    res["median"] = _metrics(np.full(te.sum(), np.median(np.exp(y[tr]))), act, raw_w[te])
+    return res
+
+
+def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=None):
     d, steps = clean_units(raw)
+    steps = list(extra_steps or []) + steps
     n = len(d)
     if n < 100 or d["listing_key"].nunique() < 20:
         sys.exit(f"Only {n} usable rows in {d['listing_key'].nunique()} buildings; too few for this model.")
@@ -1083,7 +1294,8 @@ def fit_units(raw, source_label, penalty_fraction=None):
     C, P = core.values, pen.values
     y, w, groups = np.log(d["rent"].values), d["w"].values, d["listing_key"].values
 
-    cv = _u_outer_cv(C, P, y, w, groups, d["w"].values)
+    cv = _u_outer_cv(C, P, y, w, groups, w)
+    ho = _u_holdout(C, P, y, w, groups, w)
     curve = np.mean([_u_cv_curve(C, P, y, w, groups, 10, 1, 200 + s) for s in range(SELECT_REPEATS)], axis=0)
     j = int(np.argmin(curve)) if penalty_fraction is None else int(np.argmin(np.abs(RATIOS - penalty_fraction)))
     beta, gam = _u_path(C, P, y, w, RATIOS[[j]])
@@ -1092,6 +1304,7 @@ def fit_units(raw, source_label, penalty_fraction=None):
     resid = y - fitted
     smear = float(np.average(np.exp(resid), weights=w))
     r2 = 1 - float(np.sum(w * resid ** 2) / np.sum(w * (y - np.average(y, weights=w)) ** 2))
+    r2_unit = 1 - float(np.sum(resid ** 2) / np.sum((y - y.mean()) ** 2))
 
     rng = np.random.default_rng(0)
     ub = np.unique(groups)
@@ -1110,49 +1323,62 @@ def fit_units(raw, source_label, penalty_fraction=None):
     coefs = {}
     for k, name in enumerate(CORE):
         coefs[name] = {"coef": round(float(beta[k + 1]), 5), "ci95": [round(float(blo[k + 1]), 5), round(float(bhi[k + 1]), 5)]}
-    for k, name in enumerate(pen.columns):
+    pcols = list(pen.columns)
+    for k, name in enumerate(pcols):
         if gam[k] != 0:
             coefs[name] = {"coef": round(float(gam[k]), 5), "ci95": [round(float(glo[k]), 5), round(float(ghi[k]), 5)],
                            "selected_share": round(float(freq[k]), 3)}
-    kept_amen = [c for c in pen.columns if c in meta["amenities"] and gam[list(pen.columns).index(c)] != 0]
-    zeroed = [c for c in pen.columns if gam[list(pen.columns).index(c)] == 0]
+    kept_amen = [c for c in pcols if c in meta["amenities"] and gam[pcols.index(c)] != 0]
+    zeroed = [c for c in pcols if gam[pcols.index(c)] == 0]
     q = {k: round(float(np.quantile(np.concatenate(cv["log_res"]), v)), 4)
          for k, v in {"p10": .1, "p25": .25, "p75": .75, "p90": .9}.items()}
     sc = cv["scores"]
-    improvement = (sc["median"][2] - sc["lasso"][2]) / sc["median"][2] * 100
+    improvement = (sc["median"]["mae"] - sc["lasso"]["mae"]) / sc["median"]["mae"] * 100
     means = {c: round(float(np.average(core[c], weights=w)), 5) for c in CORE}
+    src = pd.DataFrame({"source": d["source"], "res": resid})
+    source_check = {s: dict(units=int(len(g)), buildings=int(d.loc[g.index, "listing_key"].nunique()),
+                            mean_log_residual=round(float(g["res"].mean()), 4))
+                    for s, g in src.groupby("source")}
 
     caveats = [
         f"Fit on {n} units in {meta['n_buildings']} buildings. Units in one building share their amenities and "
         "location, so the effective sample for amenity and zip effects is the number of buildings, not units.",
         "Validation holds out whole buildings, so the error quoted is for a unit in a building the model has not seen.",
         "Amenities are building-level advertised features. A building that does not list an amenity is coded "
-        "'no', but listings often omit amenities they have, which pulls amenity effects toward zero.",
+        "'no', but listings often omit amenities they have, which pulls amenity effects toward zero. "
+        f"{meta['n_amen_unknown']} units had no amenity list at all and are treated as a typical building, not as 'no'.",
         "Amenity and zip effects are associations. Buildings with more amenities tend to be newer and better "
         "located, and the lasso picks among highly overlapping amenities somewhat arbitrarily.",
-        "Asking rents from available units, not signed leases; fees and concessions are not modeled.",
+        "Asking rents from available units, not signed leases; fees and concessions are not modeled. "
+        "Scope: apartments and condos with up to 4 bedrooms inside San Francisco.",
     ]
     thin = [k + "-bed" for k, v in meta["beds_counts"].items() if v < 30]
     if thin:
         caveats.append(f"Very few {', '.join(thin)} units in the training data: estimates for those sizes are not reliable.")
     if meta["skipped"]:
         caveats.append("Amenities too rare or too common to estimate: " + "; ".join(meta["skipped"]) + ".")
-    reliability = (f"moderate: typical out-of-building error about {sc['lasso'][3]:.0f}% per listing "
-                   f"(plain median: {sc['median'][3]:.0f}%); cross-validated R2 on log rent {cv['cv_r2']:.2f}")
-    info = dict(trained=str(datetime.date.today()), source=source_label, method="lasso (L1), penalty by grouped cross-validation",
+    reliability = (f"moderate: typical out-of-building error about {sc['lasso']['mape']:.0f}% per listing "
+                   f"(plain median: {sc['median']['mape']:.0f}%); cross-validated R2 on log rent {sc['lasso']['r2_log']:.2f}")
+    rnd = lambda m: {k: round(v, 3 if k.startswith(("r2", "rmse_log")) else 1) for k, v in m.items()}  # noqa: E731
+    info = dict(trained=str(datetime.date.today()), source=source_label,
+                method="lasso (L1), penalty by grouped cross-validation",
                 penalty_fraction_of_max=round(float(RATIOS[j]), 4),
                 n_raw=int(len(raw)), n_used=int(n), n_buildings=meta["n_buildings"],
-                cleaning=[f"dropped {name}: {c} rows" for name, c in steps],
-                weights="each building counts as 1 in total (file 'weight' column), so large buildings do not dominate",
+                files=files or [], cleaning=[f"dropped {name}: {c} rows" for name, c in steps],
+                weights="every building counts as 1 in total, so large buildings do not dominate the fit",
                 predictors=[c for c in coefs], amenities_kept=kept_amen, set_to_zero_by_lasso=zeroed,
-                r2_in_sample=round(r2, 3), r2_cross_validated=round(cv["cv_r2"], 3),
+                source_check=source_check,
+                r2_in_sample=round(r2, 3), r2_in_sample_unit_weighted=round(r2_unit, 3),
+                r2_cross_validated=round(sc["lasso"]["r2_log"], 3),
                 validation=dict(
                     design=f"10-fold cross-validation holding out whole buildings, repeated {CV_REPEATS}x; "
                            "the penalty is re-chosen (5-fold, buildings held out) inside every fold",
-                    lasso=dict(mae_usd=round(sc["lasso"][2]), mape_pct=round(sc["lasso"][3], 1),
-                               building_weighted_mae_usd=round(sc["lasso"][0]), building_weighted_mape_pct=round(sc["lasso"][1], 1)),
-                    beds_baths_sqft_distance_only=dict(mae_usd=round(sc["core"][2]), mape_pct=round(sc["core"][3], 1)),
-                    plain_median=dict(mae_usd=round(sc["median"][2]), mape_pct=round(sc["median"][3], 1)),
+                    cross_validated=dict(lasso=rnd(sc["lasso"]), beds_baths_sqft_distance_only=rnd(sc["core"]),
+                                         plain_median=rnd(sc["median"])),
+                    holdout_test=dict(
+                        design=f"{int(HOLDOUT_FRACTION * 100)}% of buildings (random, seed {HOLDOUT_SEED}) set aside; "
+                               "model and penalty fit on the other buildings only; test buildings scored once",
+                        **{k: (rnd(v) if isinstance(v, dict) else v) for k, v in ho.items()}),
                     mae_improvement_over_median_pct=round(improvement, 1)),
                 reliability=reliability, caveats=caveats)
     params = dict(
@@ -1166,7 +1392,7 @@ def fit_units(raw, source_label, penalty_fraction=None):
                      rent=[float(d["rent"].min()), float(d["rent"].max())]),
         zip_groups=[f"zip_{z}" for z in meta["zip_groups"]], zip_distance_km=meta["zip_dist"],
         screen=dict(skipped=meta["skipped"]),
-        _report=dict(curve=(curve, j), cv=cv, candidates=list(pen.columns), n_amen=len(meta["amenities"])))
+        _report=dict(curve=(curve, j), cv=cv, holdout=ho, candidates=pcols, n_amen=len(meta["amenities"])))
     return params, steps
 
 
@@ -1174,20 +1400,34 @@ def report_units(p, steps):
     i, r = p["info"], p["_report"]
     for name, n in steps:
         print(f"dropped {n:>4}  {name}")
-    print(f"\nused {i['n_used']} units in {i['n_buildings']} buildings")
+    print(f"\nused {i['n_used']} units in {i['n_buildings']} buildings (of {i['n_raw']} rows after pooling)")
+    for f in i["files"]:
+        print(f"  {f['file']}: {f['rows_read']} rows read, {f['rows_after_dedup']} after removing duplicates")
     print(f"lasso over {len(r['candidates'])} penalized variables ({r['n_amen']} amenities + zip effects); "
           f"unpenalized: beds, baths, log(sqft), distance to downtown")
     gain = (1 - r["curve"][0][r["curve"][1]] / r["curve"][0][0]) * 100
     print(f"penalty = {i['penalty_fraction_of_max']:.3f} of the penalty that zeroes everything "
           f"(chosen by grouped cross-validation; versus dropping every zip and amenity term it lowers "
-          f"cross-validated squared error by only {gain:.1f}%)")
-    sc = r["cv"]["scores"]
+          f"cross-validated squared error by {gain:.1f}%)")
     v = i["validation"]
-    print(f"\nout-of-building error ({v['design']}):")
-    print(f"  lasso                          MAE ${sc['lasso'][2]:>6,.0f}  ({sc['lasso'][3]:.1f}%)   building-weighted ${sc['lasso'][0]:,.0f} ({sc['lasso'][1]:.1f}%)")
-    print(f"  beds+baths+sqft+distance only  MAE ${sc['core'][2]:>6,.0f}  ({sc['core'][3]:.1f}%)")
-    print(f"  plain median                   MAE ${sc['median'][2]:>6,.0f}  ({sc['median'][3]:.1f}%)")
-    print(f"R2 on log rent: in-sample {i['r2_in_sample']}, cross-validated {i['r2_cross_validated']}")
+    h = v["holdout_test"]
+    print(f"\nTEST SET ({h['design']}):")
+    print(f"  {h['n_train_buildings']} training buildings ({h['n_train_units']} units), "
+          f"{h['n_test_buildings']} test buildings ({h['n_test_units']} units)")
+    for nm, key in (("lasso", "lasso"), ("beds+baths+sqft+distance only", "core"), ("plain median", "median")):
+        m = h[key]
+        print(f"  {nm:<31} test RMSE ${m['rmse']:>6,.0f}   MAE ${m['mae']:>6,.0f} ({m['mape']:.1f}%)   R2 {m['r2']:.2f} (log {m['r2_log']:.2f})")
+    cvs = v["cross_validated"]
+    print(f"\nrepeated cross-validation, whole buildings held out ({v['design']}):")
+    for nm, key in (("lasso", "lasso"), ("beds+baths+sqft+distance only", "beds_baths_sqft_distance_only"), ("plain median", "plain_median")):
+        m = cvs[key]
+        print(f"  {nm:<31} RMSE ${m['rmse']:>6,.0f}   MAE ${m['mae']:>6,.0f} ({m['mape']:.1f}%)   R2 {m['r2']:.2f} (log {m['r2_log']:.2f})   "
+              f"building-weighted RMSE ${m['w_rmse']:,.0f}")
+    print(f"R2 on log rent: in-sample {i['r2_in_sample']} (building-weighted) / {i['r2_in_sample_unit_weighted']} (per unit); "
+          f"cross-validated {i['r2_cross_validated']}")
+    print("\nmean in-sample log residual by source file (near 0 = the pooled sources agree):")
+    for s, c in i["source_check"].items():
+        print(f"  {s:<45} {c['units']:>5} units  {c['buildings']:>4} buildings  {c['mean_log_residual']:+.3f}")
     print("\ncoefficients (95% interval from resampling whole buildings):")
     for k, c in p["coefs"].items():
         eff = {"log_sqft": "elasticity", "dist_km": f"{(math.exp(c['coef']) - 1) * 100:+.1f}%/km"}.get(
@@ -1376,7 +1616,11 @@ def render_units(p):
 
 def main():
     ap = argparse.ArgumentParser(description="Fit the SF rent regression and write rent_model.py")
-    ap.add_argument("input", help="listings .xlsx (sheet 'All SF Listings'), listings .csv, or RealtyAPI comps .csv")
+    ap.add_argument("input", nargs="+",
+                    help="one training file: listings .xlsx (sheet 'All SF Listings'), listings .csv, RealtyAPI comps "
+                         ".csv, or a unit-level RealtyAPI training .csv. Several files are pooled without double "
+                         "counting; list the newest / most trusted first (it wins on duplicate units) and include at "
+                         "least one unit-level RealtyAPI training file.")
     ap.add_argument("--out", default="rent_model.py")
     ap.add_argument("--penalty-fraction", type=float, default=None,
                     help="unit-level training files only: override the cross-validated lasso penalty with this "
@@ -1386,16 +1630,26 @@ def main():
                     help="small hand-reviewed comps files only: lasso (default) or best-subset OLS chosen by "
                          "leave-one-out. Unit-level training files always use the lasso.")
     a = ap.parse_args()
-    table = read_table(a.input)
+    if len(a.input) > 1:
+        pool, pre_steps, files = load_pool(a.input)
+        names = ", ".join(f["file"] for f in files)
+        params, steps = fit_units(pool, f"{len(files)} files pooled and de-duplicated: {names}",
+                                  a.penalty_fraction, pre_steps, files)
+        open(a.out, "w", encoding="utf-8").write(render_units(params))
+        report_units(params, steps)
+        print("\nwrote", a.out)
+        return
+    path = a.input[0]
+    table = read_table(path)
     if "asking_rent_usd_month" not in table.columns and UNITS_REQUIRED <= set(table.columns):
-        label = a.input.replace("\\", "/").split("/")[-1]
+        label = path.replace("\\", "/").split("/")[-1]
         params, steps = fit_units(table, label + " (RealtyAPI available units; advertised asking rents)",
                                   a.penalty_fraction)
         open(a.out, "w", encoding="utf-8").write(render_units(params))
         report_units(params, steps)
         print("\nwrote", a.out)
         return
-    label = a.input.replace("\\", "/").split("/")[-1]
+    label = path.replace("\\", "/").split("/")[-1]
     if "asking_rent_usd_month" in table.columns:
         params, steps = fit_comps(table, label + " (RealtyAPI comps; advertised asking rents, hand-reviewed)",
                                    a.method)
