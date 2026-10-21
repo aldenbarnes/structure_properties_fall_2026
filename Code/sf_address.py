@@ -109,6 +109,8 @@ def parse(text):
         p.unit = toks.pop().upper()
     if len(toks) >= 2 and toks[-1] in TYPE_WORDS:
         p.stype = TYPE_WORDS[toks.pop()]
+    elif len(toks) >= 2 and len(toks[-1]) <= 3 and any(w.startswith(toks[-1]) for w in TYPE_WORDS):
+        toks.pop()                                     # a street type still being typed: "1010 anza s"
     out = []
     for i, t in enumerate(toks):
         if t in ORDINAL_WORDS:
@@ -182,6 +184,9 @@ class AddressIndex:
         for (num, street, stype), b in buildings.items():
             self.by_street.setdefault((street, stype), {})[num] = b
         self.street_names = sorted({s for s, _ in self.by_street})
+        self.types_by_street = {}
+        for s, t in self.by_street:
+            self.types_by_street.setdefault(s, []).append(t)
         self._squashed = {}
         for s in self.street_names:
             self._squashed.setdefault(_squash(s), []).append(s)
@@ -258,6 +263,34 @@ class AddressIndex:
                                  nb.longitude if close else None, nb.neighborhood if close else None)
                     out.append(Candidate(b, score - 0.05, False, notes + [
                         "{} is not in the property records (nearest: {})".format(p.number, near)], sim))
+        out.sort(key=lambda c: -c.score)
+        return out[:limit]
+
+    def suggest(self, text, limit=8):
+        """Address suggestions while typing: real SF addresses whose street starts with, or is close
+        to, what was typed, best match first."""
+        p = parse(text)
+        if not p.street or p.number is None:
+            return []
+        target = _squash(p.street)
+        streets = {s: (1.0 if _squash(s) == target else 0.97)
+                   for s in self.street_names if _squash(s).startswith(target)}
+        for s, sim in self._street_matches(p.street):
+            streets.setdefault(s, sim)
+        out = []
+        for street, sim in streets.items():
+            for stype in self.types_by_street[street]:
+                numbers = self.by_street[(street, stype)]
+                score = sim + (0.02 if p.stype == stype else -0.08 if p.stype else 0)
+                if p.number in numbers:
+                    out.append(Candidate(numbers[p.number], score + 0.05, True, [], sim))
+                else:
+                    near = min(numbers, key=lambda n: abs(int(n) - int(p.number)))
+                    nb = numbers[near]
+                    close = abs(int(near) - int(p.number)) <= NEAR_NUMBERS
+                    b = Building(p.number, street, stype, nb.latitude if close else None,
+                                 nb.longitude if close else None, nb.neighborhood if close else None)
+                    out.append(Candidate(b, score - 0.05, False, ["not in property records"], sim))
         out.sort(key=lambda c: -c.score)
         return out[:limit]
 
