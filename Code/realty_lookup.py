@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 BASE_URL = "https://apartments.realtyapi.io"
+ZILLOW_URL = "https://zillow.realtyapi.io"   # same key; covers addresses apartments.com has no listing for
 MAX_REQUESTS = 40         # per session; a guard against runaway credit use
 SEARCH_RESULTS = 40
 
@@ -63,9 +64,12 @@ class Client:
         self.cache = {}
         self.log = []      # one entry per call: what was asked and what came back (no key)
 
-    def get(self, endpoint, params):
-        cache_key = (endpoint, tuple(sorted(params.items())))
-        entry = {"endpoint": endpoint, "params": dict(params), "result": ""}
+    def get(self, endpoint, params, base=BASE_URL, check_message=True):
+        """GET base + endpoint. check_message: treat a "message" that isn't "success..." as an error
+        (the apartments.com API's convention; other RealtyAPI products may word it differently)."""
+        cache_key = (base, endpoint, tuple(sorted(params.items())))
+        entry = {"endpoint": ("" if base == BASE_URL else base.split("//")[1]) + endpoint,
+                 "params": dict(params), "result": ""}
         self.log.append(entry)
         if cache_key in self.cache:
             entry["result"] = "cached: " + _summary(self.cache[cache_key])
@@ -74,7 +78,7 @@ class Client:
             entry["result"] = "not sent: request cap reached"
             raise APIError("Request cap ({}) reached for this session.".format(self.max_requests))
         self.requests += 1
-        req = Request(BASE_URL + endpoint + "?" + urlencode(params),
+        req = Request(base + endpoint + "?" + urlencode(params),
                       headers={"x-realtyapi-key": self.key, "Accept": "application/json"})
         try:
             try:
@@ -88,7 +92,7 @@ class Client:
             if not isinstance(data, dict):
                 raise APIError("Unexpected response format on " + endpoint)
             message = str(data.get("message", ""))
-            if message and not message.lower().startswith("success"):
+            if check_message and message and not message.lower().startswith("success"):
                 raise APIError("API did not report success on {}: {}".format(endpoint, message[:200]))
         except APIError as exc:
             entry["result"] = "error: " + str(exc)
@@ -406,3 +410,102 @@ def listing_zip(r):
     z = _find_first(r, ["postalCode", "zipCode", "zip"])
     z = str(z)[:5] if z is not None else ""
     return z if re.fullmatch(r"9\d{4}", z) else None
+
+
+# ---------- Zillow ----------
+
+def zillow_by_address(client, address):
+    """Zillow's record for an address via RealtyAPI (/pro/byaddress, as RealtyAPI's own sample uses).
+    Works for buildings with no apartments.com listing: property facts, Zestimates, and the rent if listed."""
+    data = client.get("/pro/byaddress", {"propertyaddress": address}, base=ZILLOW_URL, check_message=False)
+    if not zillow_record(data):
+        message = str(data.get("message", "") or data.get("error", "")) if isinstance(data, dict) else ""
+        raise APIError("Zillow has no property for this address" + (": " + message[:150] if message else ""))
+    return data
+
+
+# Zillow homeType -> the form's property type (MULTI_FAMILY is 2 to 4 units in Zillow's usage).
+ZILLOW_HOME_TYPES = {"SINGLE_FAMILY": "Single-family home", "CONDO": "Condo", "TOWNHOUSE": "Townhouse",
+                     "MULTI_FAMILY": "Flat in 2 to 4 unit building", "APARTMENT": "Apartment in larger building"}
+
+
+def _texts(value):
+    """Lowercased strings in a Zillow field that may be a string, a list, or missing."""
+    if isinstance(value, str):
+        return [value.lower()]
+    if isinstance(value, list):
+        return [str(v).lower() for v in value if v is not None]
+    return []
+
+
+def zillow_record(data):
+    """The fields the rent form uses from a Zillow property record, or None if there is no property.
+
+    Field names follow Zillow's property JSON (bedrooms, livingArea, resoFacts.appliances, ...) and are
+    found wherever the response nests them. Amenity fields are None when Zillow doesn't say.
+    """
+    if not isinstance(data, dict):
+        return None
+    get = lambda *names: _find_first(data, list(names))
+    beds, baths = _num(get("bedrooms", "beds")), _num(get("bathrooms", "baths", "bathroomsFloat"))
+    sqft = _num(get("livingArea", "livingAreaValue", "finishedSqFt"))
+    if get("zpid") is None and beds is None and sqft is None:
+        return None
+
+    def facts(name):
+        found = _find_first(data, [name])
+        if found is not None:
+            return found
+        stack = [data]                      # lists and booleans are skipped by _find_first
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                if name in cur:
+                    return cur[name]
+                stack.extend(cur.values())
+            elif isinstance(cur, list):
+                stack.extend(cur)
+        return None
+
+    appliances = _texts(facts("appliances"))
+    laundry = " ".join(_texts(facts("laundryFeatures")))
+    if "in unit" in laundry or "inside" in laundry or ("washer" in " ".join(appliances) and "dryer" in " ".join(appliances)):
+        laundry_kind = "In-unit washer and dryer"
+    elif "common" in laundry or "shared" in laundry or "community" in laundry:
+        laundry_kind = "Shared in building"
+    elif "none" in laundry:
+        laundry_kind = "None"
+    else:
+        laundry_kind = None
+    cooling = " ".join(_texts(facts("cooling")))
+    parking = " ".join(_texts(facts("parkingFeatures")))
+    has_garage = facts("hasGarage")
+    view = " ".join(_texts(facts("view")))
+    flooring = " ".join(_texts(facts("flooring")))
+    fireplaces = facts("hasFireplace")
+    if fireplaces is None and _num(facts("fireplaces")) is not None:
+        fireplaces = _num(facts("fireplaces")) > 0
+    status = str(get("homeStatus") or "")
+    year = _num(get("yearBuilt"))
+    zipc = get("zipcode", "zipCode", "postalCode")
+    return {
+        "zpid": get("zpid"),
+        "address": get("streetAddress") or get("address"),
+        "beds": beds, "baths": baths, "sqft": sqft,
+        "year_built": int(year) if year else None,
+        "zip_code": str(zipc)[:5] if zipc else None,
+        "latitude": _num(get("latitude")), "longitude": _num(get("longitude")),
+        "home_type": ZILLOW_HOME_TYPES.get(str(get("homeType") or "").upper()),
+        "home_status": status,
+        "list_rent": _num(get("price")) if status.upper() == "FOR_RENT" else None,
+        "rent_zestimate": _num(get("rentZestimate")),
+        "zestimate": _num(get("zestimate")),
+        "laundry": laundry_kind,
+        "dishwasher": True if any("dishwasher" in a for a in appliances) else (False if appliances else None),
+        "air_conditioning": (bool(cooling) and "none" not in cooling) if cooling else None,
+        "fireplace": fireplaces if isinstance(fireplaces, bool) else None,
+        "garage": True if (has_garage is True or "garage" in parking) else (False if has_garage is False else None),
+        "view": ("Water or bay view" if any(w in view for w in ("bay", "water", "ocean")) else
+                 "City or partial view" if view and "none" not in view else None),
+        "hardwood": True if "hardwood" in flooring or "wood" in flooring else None,
+    }
