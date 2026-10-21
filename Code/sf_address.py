@@ -13,6 +13,7 @@ Standard library only.
 """
 import csv
 import difflib
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +81,7 @@ def pretty_street(name, stype):
 @dataclass
 class Parsed:
     number: str = None       # house number, e.g. "1010"
+    number_hi: str = None    # end of an address range, e.g. "1505" in "1501-1505 Masonic Ave"
     street: str = ""         # street name in assessor style, without type, e.g. "ANZA"
     stype: str = None        # assessor type code, e.g. "ST"; None if not typed
     unit: str = None
@@ -102,7 +104,8 @@ def parse(text):
     s = re.sub(r"[^a-z0-9\s-]", " ", s)
     toks = s.split()
     if toks and re.match(r"^\d+(-\d+)?[a-z]?$", toks[0]) and len(toks) > 1:
-        p.number = re.match(r"^\d+", toks[0]).group(0)
+        m = re.match(r"^(\d+)(?:-(\d+))?", toks[0])
+        p.number, p.number_hi = m.group(1), m.group(2)
         toks = toks[1:]
     # A trailing unit number like "1010 anza st 5" (only after a street type).
     if len(toks) >= 3 and toks[-2] in TYPE_WORDS and re.match(r"^[0-9]+[a-z]?$", toks[-1]) and not p.unit:
@@ -309,13 +312,79 @@ def same_unit(typed, unit):
     return norm(typed) == norm(unit)
 
 
+def street_similarity(address_text, building):
+    """0-1 similarity of a listing address's street name to the building's street."""
+    p = parse(address_text or "")
+    if not p.street:
+        return 0.0
+    return difflib.SequenceMatcher(None, _squash(p.street), _squash(building.street)).ratio()
+
+
 def same_building(address_text, building):
-    """0-1 score for whether a listing address (e.g. RealtyAPI oneLineAddress) is `building`."""
+    """0-1 score for whether a listing address (e.g. RealtyAPI oneLineAddress) is `building`.
+
+    Full street similarity when the house number matches or falls inside an address range
+    ("1501-1505 Masonic Ave" covers 1503); half when it is a few numbers away on the same side
+    of the street (same odd/even parity), which alone is not enough to call it a match.
+    """
     p = parse(address_text or "")
     if building.number is None or p.number is None:
         return 0.0
-    street_sim = difflib.SequenceMatcher(None, _squash(p.street), _squash(building.street)).ratio()
-    if p.number == building.number:
+    street_sim = street_similarity(address_text, building)
+    n, lo = int(building.number), int(p.number)
+    hi = int(p.number_hi) if p.number_hi and int(p.number_hi) >= lo else lo
+    if lo <= n <= hi:
         return street_sim
-    lo, hi = sorted((int(p.number), int(building.number)))
-    return street_sim * 0.5 if hi - lo <= 10 else 0.0   # address ranges like 1010-1012
+    if min(abs(n - lo), abs(n - hi)) <= 10 and n % 2 == lo % 2:
+        return street_sim * 0.5
+    return 0.0
+
+
+def same_side(address_text, building):
+    """False when a listing on the building's street is across the street (odd vs even numbers)."""
+    p = parse(address_text or "")
+    if building.number is None or p.number is None:
+        return True
+    return int(p.number) % 2 == int(building.number) % 2
+
+
+class ZipGuesser:
+    """Zip code for a location, from the nearest listings with known zips (training data and comps).
+
+    SF property records have no zip. A zip helps apartments.com resolve an address, and is needed
+    for the zip-wide search; a wrong guess near a zip boundary only makes that search less useful.
+    """
+
+    def __init__(self, points):
+        self.points = points                     # [(lat, lon, zip)]
+
+    @classmethod
+    def load(cls, paths=None):
+        data = Path(__file__).resolve().parent.parent / "Data"
+        paths = paths or [data / "realty_training.csv", data / "RealtyAPI_1010_Anza_Comps.csv"]
+        points = {}
+        for path in paths:
+            try:
+                with open(path, newline="", encoding="utf-8-sig") as f:
+                    for r in csv.DictReader(f):
+                        lat, lon = _num(r.get("latitude")), _num(r.get("longitude"))
+                        z = (r.get("zip_code") or "").strip()[:5]
+                        if lat and lon and re.fullmatch(r"9\d{4}", z):
+                            points[(round(lat, 5), round(lon, 5))] = z
+            except OSError:
+                continue
+        return cls([(lat, lon, z) for (lat, lon), z in points.items()])
+
+    def guess(self, lat, lon, max_m=600, k=5, agree=0.8):
+        """The zip shared by at least `agree` of the k nearest known listings within max_m meters,
+        or None (no listings nearby, or near a zip boundary where they disagree)."""
+        if lat is None or lon is None or not self.points:
+            return None
+        coslat = math.cos(math.radians(lat))
+        near = sorted((math.hypot((plat - lat) * 111_000, (plon - lon) * 111_000 * coslat), z)
+                      for plat, plon, z in self.points)
+        near = [z for d, z in near[:k] if d <= max_m]
+        if not near:
+            return None
+        best = max(set(near), key=near.count)
+        return best if near.count(best) >= agree * len(near) else None
