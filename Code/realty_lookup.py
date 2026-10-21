@@ -23,8 +23,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 BASE_URL = "https://apartments.realtyapi.io"
-MAX_REQUESTS = 20         # per session; a guard against runaway credit use
-SEARCH_RESULTS = 10
+MAX_REQUESTS = 40         # per session; a guard against runaway credit use
+SEARCH_RESULTS = 40
 
 # Candidate field names, compared case-insensitively. The first one present wins.
 UNIT_KEYS = {
@@ -363,3 +363,46 @@ def search(client, location, result_count=SEARCH_RESULTS):
 
 def details(client, listing_key):
     return client.get("/details/byid", {"listingKey": listing_key})
+
+
+def details_by_address(client, address):
+    """/details/byaddress: the property record for a street address ("1503 Masonic Ave, San Francisco, CA").
+
+    RealtyAPI documents this endpoint (it resolves the address with apartments.com's typeahead),
+    but the parameter name "address" is assumed from its sibling APIs, not confirmed.
+    """
+    return client.get("/details/byaddress", {"address": address})
+
+
+def listing_address(r):
+    """Best street address for a search result or details record: oneLineAddress, an address
+    object's street line, or a name that starts with a house number."""
+    if not isinstance(r, dict):
+        return None
+    if isinstance(r.get("oneLineAddress"), str) and r["oneLineAddress"].strip():
+        return r["oneLineAddress"]
+    a = r.get("address")
+    if isinstance(a, str) and a.strip():
+        return a
+    if isinstance(a, dict):
+        line = _pick(a, ["streetAddress", "addressLine1", "lineOne", "line1", "street", "address"])
+        if isinstance(line, str):
+            return line
+    found = _find_first(r, ["oneLineAddress", "fullAddress", "streetAddress"])
+    if isinstance(found, str):
+        return found
+    name = r.get("name")
+    return name if isinstance(name, str) and re.match(r"^\d", name.strip()) else None
+
+
+def listing_coords(r):
+    """(lat, lon) of a search result or details record, wherever the coordinates are nested."""
+    lat = _num(_find_first(r, ["latitude", "lat"]))
+    lon = _num(_find_first(r, ["longitude", "lng", "lon"]))
+    return (lat, lon) if lat is not None and lon is not None else (None, None)
+
+
+def listing_zip(r):
+    z = _find_first(r, ["postalCode", "zipCode", "zip"])
+    z = str(z)[:5] if z is not None else ""
+    return z if re.fullmatch(r"9\d{4}", z) else None
