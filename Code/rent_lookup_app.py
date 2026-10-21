@@ -68,7 +68,7 @@ FORM_DEFAULTS = {"f_beds": None, "f_baths": None, "f_sqft": None, "f_floor": Non
                  **{"s_" + k: fa.UNKNOWN for k in fa.SELECTS}, **{ck(f): False for f in CHECKS},
                  **{mk(m): False for m in EXTRA_MODEL}}
 ss = st.session_state
-for k, v in {"lookup_steps": [], "results": [], "units": [], "details": None, "summary": None, "amen_names": [], "building": None,
+for k, v in {"zillow": None, "lookup_steps": [], "results": [], "units": [], "details": None, "summary": None, "amen_names": [], "building": None,
              "typed_unit": None, "typed_zip": None, "msg": None, "last_pick": None, "unit_idx": -1,
              "load_id": 0, "result": None, "floor_note": None, **FORM_DEFAULTS}.items():
     ss.setdefault(k, v)
@@ -172,7 +172,7 @@ def fill_amenities(names):
 def reset_lookup():
     """Start a new lookup: forget the last property and clear its features."""
     ss.results, ss.msg, ss.details, ss.units, ss.amen_names = [], None, None, [], []
-    ss.building, ss.typed_unit, ss.typed_zip, ss.lookup_steps = None, None, None, []
+    ss.building, ss.typed_unit, ss.typed_zip, ss.lookup_steps, ss.zillow = None, None, None, [], None
     ss.unit_idx, ss.result, ss.floor_note = -1, None, None
     for k, v in FORM_DEFAULTS.items():
         ss[k] = v
@@ -233,12 +233,36 @@ def rank_results(results, building):
     return rows
 
 
+def fill_from_zillow(rec):
+    """Fill the form from a Zillow property record (a building with no apartments.com listing)."""
+    ss.zillow = rec
+    ss.f_beds, ss.f_baths = rec["beds"], rec["baths"]
+    ss.f_sqft = int(round(rec["sqft"])) if rec["sqft"] else None
+    ss.f_year = rec["year_built"] or ss.f_year
+    ss.f_zip = rec["zip_code"] or ss.f_zip
+    if rec["latitude"] is not None and rec["longitude"] is not None:
+        ss.f_lat, ss.f_lon = rec["latitude"], rec["longitude"]
+    if rec["home_type"]:
+        ss.s_property_type = rec["home_type"]
+    if rec["laundry"]:
+        ss.f_laundry = rec["laundry"]
+    if rec["garage"]:
+        ss.s_parking = "Assigned garage space"
+    if rec["view"]:
+        ss.s_view = rec["view"]
+    for feature, field in [("Dishwasher", "dishwasher"), ("Air conditioning", "air_conditioning"),
+                           ("Fireplace", "fireplace"), ("Hardwood floors", "hardwood")]:
+        ss[ck(feature)] = bool(rec[field])
+    ss.f_unticked_no = False             # Zillow's facts are incomplete: unticked stays unknown
+    ss.result = None
+
+
 def find_building(client, building):
-    """Find the building's listing with up to three lookups, stopping at the first that finds it:
-    1. /details/byaddress, built for exactly this (skipped for the session once RealtyAPI rejects it);
-    2. a search on the address, which apartments.com treats as an area search;
-    3. a search of the whole zip code, matched by address or coordinates.
-    If nothing matches, the listings seen are offered by distance, as comparables."""
+    """Find the building with up to three lookups, stopping at the first that finds it:
+    1. apartments.com /details/byaddress (skipped for the session once RealtyAPI rejects the call);
+    2. an apartments.com search on the address (an area search; 40 results);
+    3. Zillow's record for the address, which covers buildings with no apartments.com listing.
+    If apartments.com has nothing at the address, its nearby listings are offered as comparables."""
     full = building.query                              # "1503 Masonic Ave, San Francisco, CA"
     steps, seen = [], {}
 
@@ -246,67 +270,102 @@ def find_building(client, building):
         for x in rows:
             seen.setdefault(x["r"].get("listingKey"), x)
         matches = [x for x in rows if x["match"]]
-        steps.append("{}: {} listing(s), {}.".format(label, n, "{} at this address".format(len(matches))
-                                                      if matches else "none at this address"))
+        on_street = [x for x in rows if not x["match"] and x["addr"]
+                     and sf_address.street_similarity(x["addr"], building) >= 0.85]
+        note = "{} at this address".format(len(matches)) if matches else "none at this address"
+        if on_street and not matches:
+            note += " (on the same street: {})".format(", ".join(
+                (x["addr"].split(",")[0] + (" {:,.0f} m".format(x["dist"]) if x["dist"] is not None else ""))
+                for x in on_street[:4]))
+        steps.append("{}: {} listing(s), {}.".format(label, n, note))
         return matches
+
+    def done(matches):
+        ss.lookup_steps = steps
+        if len(matches) == 1:
+            load_property(client, matches[0]["r"]["listingKey"], matches[0]["r"])
+        else:
+            ss.results, ss.prop_idx = matches, 0
+            ss.msg = ("info", "{} listings at this address. Pick the right one, then Load.".format(len(matches)))
 
     if not ss.get("byaddress_off"):
         try:
             rec = rl.details_by_address(client, full)
         except rl.APIError as exc:
-            note = ""
-            if re.search(r"HTTP 4(00|04|22)", str(exc)):
-                ss.byaddress_off, note = True, " Skipped for the rest of this session."
-            steps.append("Direct address lookup: {}.{}".format(exc, note))
+            if "not indexed" in str(exc):
+                steps.append("apartments.com address lookup: address not indexed by apartments.com.")
+            else:
+                note = ""
+                if re.search(r"HTTP 4(00|04|22)", str(exc)):
+                    ss.byaddress_off, note = True, " Skipped for the rest of this session."
+                steps.append("apartments.com address lookup: {}.{}".format(exc, note))
         else:
             key = rl._find_first(rec, ["listingKey"])
             lat, lon = rl.listing_coords(rec)
             stub = {"listingKey": key, "oneLineAddress": rl.listing_address(rec), "latitude": lat, "longitude": lon,
                     "name": rl._find_first(rec, ["propertyName", "name"])}
             if key or rl.find_units(rec):
-                matches = take(rank_results([stub], building), "Direct address lookup", 1)
+                matches = take(rank_results([stub], building), "apartments.com address lookup", 1)
                 if matches:
                     ss.lookup_steps = steps
-                    if rl.find_units(rec):
-                        load_property(client, key, stub, data=rec)
-                    else:
-                        load_property(client, key, stub)
+                    load_property(client, key, stub, data=rec if rl.find_units(rec) else None)
                     return
             else:
-                steps.append("Direct address lookup: no listing for this address.")
+                steps.append("apartments.com address lookup: no listing for this address.")
 
-    for label, location, count in [("Address search", full, rl.SEARCH_RESULTS), ("Zip search", None, 100)]:
-        if location is None:     # zip of the nearest listing apartments.com returned, else a local guess
-            near = [x for x in seen.values() if x["dist"] is not None and x["dist"] <= 300]
-            z = next((rl.listing_zip(x["r"]) for x in sorted(near, key=lambda x: x["dist"])
-                      if rl.listing_zip(x["r"])), None) or zip_guesser().guess(building.latitude, building.longitude)
-            if not z:
-                steps.append("Zip search: skipped (zip code unknown).")
-                break
-            location, label = "San Francisco, CA {}".format(z), "Zip {} search".format(z)
-        try:
-            results = rl.search(client, location, result_count=count)
-        except rl.APIError as exc:
-            steps.append("{}: {}.".format(label, exc))
-            continue
-        matches = take(rank_results(results, building), label, len(results))
-        if len(matches) == 1:
-            ss.lookup_steps = steps
-            load_property(client, matches[0]["r"]["listingKey"], matches[0]["r"])
-            return
+    try:
+        results = rl.search(client, full)
+    except rl.APIError as exc:
+        steps.append("apartments.com address search: {}.".format(exc))
+    else:
+        matches = take(rank_results(results, building), "apartments.com address search", len(results))
         if matches:
-            ss.lookup_steps, ss.results, ss.prop_idx = steps, matches, 0
-            ss.msg = ("info", "{} listings at this address. Pick the right one, then Load.".format(len(matches)))
+            return done(matches)
+
+    try:
+        rec = rl.zillow_record(rl.zillow_by_address(client, full))
+    except rl.APIError as exc:
+        steps.append("Zillow: {}.".format(exc))
+    else:
+        zaddr = rec["address"] if isinstance(rec["address"], str) else None
+        dist = rl.distance_m(building.latitude, building.longitude, rec["latitude"], rec["longitude"])
+        if (zaddr and sf_address.same_building(zaddr, building) >= 0.85) or (dist is not None and dist <= MATCH_METERS):
+            steps.append("Zillow: found {}.".format(zaddr or building.address))
+            ss.lookup_steps = steps
+            fill_from_zillow(rec)
+            facts = ", ".join(x for x in [
+                rec["home_type"],
+                "{:g} bd / {:g} ba".format(rec["beds"], rec["baths"]) if rec["beds"] is not None and rec["baths"] is not None else None,
+                "{:,.0f} sq ft".format(rec["sqft"]) if rec["sqft"] else None] if x) or "no details"
+            ss.msg = ("success", "Found on Zillow: {} ({}). It has no apartments.com listing, so there is no unit list; "
+                                 "the form is filled from Zillow's record. Check it, then press Estimate rent."
+                      .format(building.address, facts))
             return
+        steps.append("Zillow: returned a different address ({}), not used.".format(zaddr or "unknown"))
 
     ss.lookup_steps = steps
     rows = sorted((x for x in seen.values() if x["r"].get("listingKey")),
                   key=lambda x: x["dist"] if x["dist"] is not None else 1e12)[:20]
     ss.results, ss.prop_idx = rows, 0
-    ss.msg = ("warning", "No current apartments.com listing found at {}.{} Enter the features by hand (location is "
+    ss.msg = ("warning", "{} wasn't found on apartments.com or Zillow. Enter the features by hand (location is "
                          "filled in from property records){}.".format(
-                             building.address, "" if rows else " No listings nearby either.",
-                             ", or load a nearby listing below as a comparable" if rows else ""))
+                             building.address, ", or load a nearby listing below as a comparable" if rows else ""))
+
+
+def search_zip(client):
+    """apartments.com listings in the building's zip code, nearest first, as comparables (one request)."""
+    b = ss.building
+    z = (ss.f_zip or "").strip() or zip_guesser().guess(b.latitude, b.longitude)
+    try:
+        results = rl.search(client, "San Francisco, CA {}".format(z), result_count=100)
+    except rl.APIError as exc:
+        ss.msg = ("error", str(exc))
+        return
+    rows = rank_results(results, b)
+    ss.results, ss.prop_idx = rows[:25], 0
+    ss.msg = ("info", "{} apartments.com listing(s) in {}; the nearest are listed below. Loading one replaces the "
+                      "form with that listing's unit.".format(len(results), z) if results
+              else "No apartments.com listings found in {}.".format(z))
 
 
 def search_typed(client, query):
@@ -374,9 +433,9 @@ with st.sidebar:
         key = st.text_input("API key", type="password", help="Not saved. Leave blank to type features in by hand.").strip()
     client = get_client(key)
     requests_slot = st.empty()       # filled in at the end, after this run's lookups
-    st.caption("Picking an address uses up to 3 lookups (direct address, address search, zip search), "
-               "stopping at the first that finds the building, plus 1 to load its units. An apartments.com URL "
-               "or listing key costs 1. Repeat lookups are cached.")
+    st.caption("Picking an address uses up to 3 lookups (apartments.com address lookup, apartments.com search, "
+               "Zillow), stopping at the first that finds the building, plus 1 to load apartments.com units. "
+               "An apartments.com URL or listing key costs 1. Repeat lookups are cached.")
     st.divider()
     st.caption("SF model: " + rent_model.MODEL_INFO["reliability"])
     st.caption("Trained on {} units in {} buildings, weighted toward SoMa, Mission Bay and downtown; "
@@ -411,6 +470,13 @@ if ss.building is not None and ss.building.facts:
     st.caption("Property records for {}: {}".format(ss.building.address, ss.building.facts))
 if ss.lookup_steps:
     st.caption("How it was looked up: " + " ".join("{}. {}".format(i + 1, t) for i, t in enumerate(ss.lookup_steps)))
+if ss.zillow:
+    z = ss.zillow
+    bits = ["Rent Zestimate ${:,.0f}/mo".format(z["rent_zestimate"]) if z["rent_zestimate"] else None,
+            "listed for rent at ${:,.0f}/mo".format(z["list_rent"]) if z["list_rent"] else None,
+            "status: " + z["home_status"].replace("_", " ").lower() if z["home_status"] else None,
+            "value Zestimate ${:,.0f}".format(z["zestimate"]) if z["zestimate"] else None]
+    st.caption("Zillow: " + "; ".join(b for b in bits if b) + ".")
 
 if ss.results:
     def prop_label(i):
@@ -423,6 +489,11 @@ if ss.results:
     prop_labels = [prop_label(i) for i in range(len(ss.results))]
     st.selectbox("Listings", range(len(ss.results)), key="prop_idx", format_func=prop_labels.__getitem__)
     st.button("Load this listing", on_click=on_load, args=(client,))
+z_known = (ss.f_zip or "").strip() or (ss.building is not None and ss.building.latitude is not None
+                                       and zip_guesser().guess(ss.building.latitude, ss.building.longitude))
+if client is not None and ss.building is not None and ss.details is None and z_known:
+    st.button("Find comparable apartments.com listings in {} (1 request)".format(z_known), on_click=search_zip,
+              args=(client,))
 
 if ss.details is not None and ss.units:
     st.subheader("Units")
@@ -562,7 +633,13 @@ def run_estimate():
     adj = fa.adjust(model["estimate"], choices)
     i = ss.unit_idx
     listed = ss.units[i].get("rent") if ss.details is not None and 0 <= i < len(ss.units) else None
-    return {"model": model, "adj": adj, "listed": listed, "notes": notes, "amenities": amenities}
+    compare = ("Listed asking rent", listed) if listed else None
+    if compare is None and ss.zillow:
+        if ss.zillow["list_rent"]:
+            compare = ("Zillow asking rent", ss.zillow["list_rent"])
+        elif ss.zillow["rent_zestimate"]:
+            compare = ("Zillow Rent Zestimate", ss.zillow["rent_zestimate"])
+    return {"model": model, "adj": adj, "compare": compare, "notes": notes, "amenities": amenities}
 
 
 if estimate_clicked:
@@ -573,7 +650,7 @@ st.subheader("Estimate")
 if ss.result is None:
     st.info("Fill in the unit above, then press Estimate rent.")
 else:
-    model, adj, listed = ss.result["model"], ss.result["adj"], ss.result["listed"]
+    model, adj, compare = ss.result["model"], ss.result["adj"], ss.result["compare"]
     est = adj["estimate"]
     low, high = model["low"] * adj["factor"], model["high"] * adj["factor"]
     # Metric values are markdown, where a pair of "$" starts math, so dollar signs are escaped.
@@ -583,9 +660,9 @@ else:
     c1.metric("Estimated rent / mo", "\\${:,.0f}".format(est))
     c2.metric("Likely low", "\\${:,.0f}".format(low), help=range_help)
     c3.metric("Likely high", "\\${:,.0f}".format(high), help=range_help)
-    if listed:
-        c4.metric("Listed asking rent", "\\${:,.0f}".format(listed),
-                  delta="{:+.0%} vs estimate".format(listed / est - 1), delta_color="off")
+    if compare:
+        c4.metric(compare[0], "\\${:,.0f}".format(compare[1]),
+                  delta="{:+.0%} vs estimate".format(compare[1] / est - 1), delta_color="off")
     for n in ss.result["notes"]:
         st.info(n)
 
