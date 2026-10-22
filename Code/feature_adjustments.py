@@ -67,7 +67,7 @@ OVERLAPS_CONDITION = {"Elevator", "Fitness center", "Pool", "Shared roof deck or
                       "EV charging", "Bike storage", "Air conditioning", "Central heat"}
 CONDITION_OVERLAP = {"New construction", "Fully renovated"}
 
-# Advertised amenity names (normalized: lowercase, punctuation removed) that mean each checkbox.
+# Advertised amenity names (normalized: lowercase, punctuation removed) that mean each yes/no feature.
 # Used both to pre-check boxes from a RealtyAPI listing and to measure training prevalence.
 AMENITY_NAMES = {
     "Dishwasher": ["dishwasher"],
@@ -259,7 +259,7 @@ def _norm(s):
 
 
 def training_prevalence(path=TRAINING_PATH):
-    """Share of training buildings advertising each checkbox feature (each building counted once)."""
+    """Share of training buildings advertising each yes/no feature (each building counted once)."""
     buildings = {}
     try:
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -296,9 +296,9 @@ def adjustments(choices):
     """List of adjustment rows for the user's choices.
 
     choices: {"property_type": "...", "condition": "...", ..., "floor": 4 or None,
-              "features": set of checked UNIT_FEATURES + BUILDING_FEATURES,
-              "unticked_means_no": True if an unchecked feature is known to be missing
-                                   (False: unchecked = unknown, so nothing is subtracted),
+              "features": UNIT_FEATURES + BUILDING_FEATURES the unit has (answered Yes),
+              "missing": features it is known not to have (answered No); anything in neither
+                         set is unsure and gets no adjustment,
               "skip": SELECTS keys and feature names rent_model already prices (no study premium)}
     """
     rows = []
@@ -327,7 +327,7 @@ def adjustments(choices):
         if view and view not in (UNKNOWN, "None"):
             steps, detail = steps / 2, detail + ", halved because the view is priced separately"
         rows.append(_row("Floor", eff, steps, detail))
-    checked = choices.get("features") or set()
+    has, missing = choices.get("features") or set(), choices.get("missing") or set()
     for feat in UNIT_FEATURES + BUILDING_FEATURES:
         if feat in skip:
             continue
@@ -335,9 +335,9 @@ def adjustments(choices):
         if not eff or not eff["value"]:
             continue
         p = PREVALENCE.get(feat, 0.0)
-        if feat in checked:
+        if feat in has:
             share, detail = 1.0 - p, "Has it"
-        elif p > 0 and choices.get("unticked_means_no", True):
+        elif feat in missing and p > 0:
             share, detail = -p, "Doesn't have it"
         else:
             continue
