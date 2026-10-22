@@ -44,7 +44,7 @@ MODEL_FROM_CHECKBOX = {"air_conditioning": "Air conditioning", "dishwasher": "Di
                        "roof_terrace": "Shared roof deck or yard"}
 MODEL_FROM_SELECT = {"parking": "parking", "utilities_included": "utilities"}
 MODEL_FROM_LAUNDRY = {"in_unit_laundry": "In-unit washer and dryer", "shared_laundry": "Shared in building"}
-# Model amenities with no matching field in the form get a checkbox of their own.
+# Model amenities with no matching field in the form get a yes/no/unsure question of their own.
 EXTRA_MODEL = [m for m in MODEL_AMENITIES
                if m not in MODEL_FROM_CHECKBOX and m not in MODEL_FROM_SELECT and m not in MODEL_FROM_LAUNDRY]
 EXTRA_LABELS = {"doorman_concierge": "Doorman / concierge", "washer_dryer_hookup": "Washer/dryer hookups"}
@@ -62,11 +62,22 @@ def mk(model_name):
     return "m_" + model_name
 
 
-# Values a new lookup resets to. f_* are the unit form's fields, s_* its dropdowns, x_*/m_* its checkboxes.
+# Each feature is answered Yes, No or Unsure; Unsure means no adjustment (the model assumes a typical building).
+YES, NO, UNSURE = "Yes", "No", "Unsure"
+ANSWERS = [YES, NO, UNSURE]
+
+
+def answer(flag):
+    """True/False/None -> Yes/No/Unsure."""
+    return UNSURE if flag is None else (YES if flag else NO)
+
+
+# Values a new lookup resets to. f_* are the unit form's fields, s_* its dropdowns, x_*/m_* its yes/no/unsure
+# features (x_ for the form's named features, m_ for model amenities with no other field).
 FORM_DEFAULTS = {"f_beds": None, "f_baths": None, "f_sqft": None, "f_floor": None, "f_year": None, "f_zip": "",
-                 "f_lat": None, "f_lon": None, "f_laundry": fa.UNKNOWN, "f_unticked_no": False,
-                 **{"s_" + k: fa.UNKNOWN for k in fa.SELECTS}, **{ck(f): False for f in CHECKS},
-                 **{mk(m): False for m in EXTRA_MODEL}}
+                 "f_lat": None, "f_lon": None, "f_laundry": fa.UNKNOWN,
+                 **{"s_" + k: fa.UNKNOWN for k in fa.SELECTS}, **{ck(f): UNSURE for f in CHECKS},
+                 **{mk(m): UNSURE for m in EXTRA_MODEL}}
 ss = st.session_state
 for k, v in {"zillow": None, "lookup_steps": [], "results": [], "units": [], "details": None, "summary": None, "amen_names": [], "building": None,
              "typed_unit": None, "typed_zip": None, "msg": None, "last_pick": None, "unit_idx": -1,
@@ -156,15 +167,16 @@ def fill_amenities(names):
         ss.s_parking = "Shared garage space"          # listings say parking exists, not which kind
     if flags["utilities_included"]:
         ss.s_utilities = "Water, sewer, garbage"      # the smallest bundle; adjust if more is included
+    # With an amenity list, anything not on it is No (how the model's training listings were coded);
+    # without one, every feature stays Unsure.
     advertised = fa.checks_from_amenities(names)
     for f in CHECKS:
-        ss[ck(f)] = f in advertised
+        ss[ck(f)] = answer(f in advertised if names else None)
     for m, f in MODEL_FROM_CHECKBOX.items():
         if flags.get(m):
-            ss[ck(f)] = True
+            ss[ck(f)] = YES
     for m in EXTRA_MODEL:
-        ss[mk(m)] = bool(flags.get(m))
-    ss.f_unticked_no = bool(names)       # a listing's amenity list says what the building lacks
+        ss[mk(m)] = answer(flags.get(m))
 
 
 # ---------- lookup ----------
@@ -252,8 +264,8 @@ def fill_from_zillow(rec):
         ss.s_view = rec["view"]
     for feature, field in [("Dishwasher", "dishwasher"), ("Air conditioning", "air_conditioning"),
                            ("Fireplace", "fireplace"), ("Hardwood floors", "hardwood")]:
-        ss[ck(feature)] = bool(rec[field])
-    ss.f_unticked_no = False             # Zillow's facts are incomplete: unticked stays unknown
+        if rec[field] is not None:       # Zillow's facts are incomplete: what it doesn't state stays Unsure
+            ss[ck(feature)] = answer(rec[field])
     ss.result = None
 
 
@@ -535,11 +547,11 @@ def select(col, key):
                   help=PRICED_BY_MODEL if key in MODEL_PRICED else PRICED_BY_STUDIES)
 
 
-def checkboxes(items):
-    """items: (session key, label, help) tuples, laid out in three columns."""
+def questions(items):
+    """items: (session key, label, help) tuples, each a Yes / No / Unsure choice, in three columns."""
     cols = st.columns(3)
     for i, (key, label, help_text) in enumerate(items):
-        cols[i % 3].checkbox(label, key=key, help=help_text)
+        cols[i % 3].radio(label, ANSWERS, key=key, help=help_text, horizontal=True)
 
 
 def feature_items(features):
@@ -578,13 +590,11 @@ with st.form("unit_form"):
     select(c1, "view")
 
     st.markdown("**Unit features**")
-    st.toggle("Unticked means the unit doesn't have it", key="f_unticked_no",
-              help="On: a missing feature that many training buildings have lowers the estimate a little. "
-                   "Off: unticked boxes are treated as unknown. Turned on automatically when the listing "
-                   "includes an amenity list.")
-    checkboxes(feature_items(fa.UNIT_FEATURES))
+    st.caption("Unsure means no adjustment. No lowers the estimate a little for features many training "
+               "buildings have. A listing's amenity list fills these in.")
+    questions(feature_items(fa.UNIT_FEATURES))
     st.markdown("**Building amenities**")
-    checkboxes(feature_items(fa.BUILDING_FEATURES)
+    questions(feature_items(fa.BUILDING_FEATURES)
                + [(mk(m), EXTRA_LABELS.get(m, m.replace("_", " ").capitalize()), PRICED_BY_MODEL) for m in EXTRA_MODEL])
 
     estimate_clicked = st.form_submit_button("Estimate rent", type="primary")
@@ -600,7 +610,7 @@ if other:
 def model_amenity_inputs():
     """rent_model amenity inputs from the form: True, False, or None for unknown."""
     def box(key):
-        return True if ss[key] else (False if ss.f_unticked_no else None)
+        return {YES: True, NO: False}.get(ss[key])
     out = {}
     for m in MODEL_AMENITIES:
         if m in MODEL_FROM_LAUNDRY:
@@ -627,8 +637,8 @@ def run_estimate():
         latitude=lat, longitude=lon, amenities=amenities)
     choices = {k: ss["s_" + k] for k in fa.SELECTS}
     choices["floor"] = ss.f_floor
-    choices["features"] = {f for f in CHECKS if ss[ck(f)]}
-    choices["unticked_means_no"] = ss.f_unticked_no
+    choices["features"] = {f for f in CHECKS if ss[ck(f)] == YES}
+    choices["missing"] = {f for f in CHECKS if ss[ck(f)] == NO}
     choices["skip"] = MODEL_PRICED
     adj = fa.adjust(model["estimate"], choices)
     i = ss.unit_idx
@@ -692,7 +702,7 @@ else:
     # Table cells are markdown too: escape "$" so pairs of dollar amounts don't render as math.
     st.table(pd.DataFrame(rows).set_index("Factor").map(lambda t: t.replace("$", "\\$")))
     if not adj["rows"]:
-        st.caption("No study-based adjustments: every other feature is Unknown, unchecked, or the same as the "
+        st.caption("No study-based adjustments: every other feature is Unknown, Unsure, or the same as the "
                    "typical building the model was trained on.")
     sources = {}
     for r in adj["rows"]:
