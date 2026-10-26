@@ -43,7 +43,15 @@ Two kinds of input are recognised automatically:
      file are skipped; the rest are added as extra buildings with an unknown
      amenity list (treated as a typical building, never as 'no'). Amenities named
      only in the comps file are ignored so a naming difference cannot read as
-     'not offered'. Everything from here on describes input type 1.
+     'not offered'.
+
+     Crime (unit-level files only): add  --parcels properties.csv --crime-table crime_neighborhood.csv
+     and optionally  --incidents Police_Department_Incident_Reports....csv  (rates are then recomputed
+     from that file's latest 12 months, which is how the crime data is refreshed). Each building is placed in
+     a neighborhood by its nearest assessor parcel and two unpenalized variables are added: log(1 + violent
+     incidents per 1,000 residential units) and the same for property incidents. The validation report
+     prints the cross-validated error with and without them. The incident file is ~200 MB: do not commit it.
+     Everything from here on describes input type 1.
 
 What it does:
   1. Cleans the listings (rules printed at run time and saved in the output file).
@@ -1120,7 +1128,106 @@ def clean_units(raw):
     return d, steps
 
 
-def _units_design(d):
+CRIME_FEATURES = ["crime_violent", "crime_property"]  # log(1 + incidents per 1,000 residential units); never penalized
+VIOLENT_CATEGORIES = {"Assault", "Robbery", "Homicide", "Rape", "Sex Offense"}
+PROPERTY_CATEGORIES = {"Larceny Theft", "Burglary", "Motor Vehicle Theft", "Malicious Mischief", "Arson"}
+MIN_HOOD_UNITS = 1000     # neighborhoods with fewer residential units get no rate (too unstable)
+MAX_PARCEL_M = 500        # a building farther than this from every assessor parcel gets no neighborhood
+
+
+def load_crime(parcels_path, table_path=None, incidents_path=None):
+    """Violent and property incidents per 1,000 residential units for each SF analysis neighborhood.
+
+    parcels_path    DataFrame-style CSV of assessor parcels (latitude, longitude, analysis_neighborhood, units).
+                    Used to put each training building in a neighborhood (nearest parcel) and, when the
+                    table has no unit count, to count residential units.
+    table_path      crime_neighborhood.csv (residential_units, violent_per_1000_units, property_per_1000_units).
+    incidents_path  optional raw SFPD incident file (Incident Date, Incident Category, Analysis Neighborhood).
+                    When given, the rates are recomputed from the 12 months ending on the file's latest
+                    incident date, so refreshing the crime data means re-downloading this one file.
+    """
+    parcels = pd.read_csv(parcels_path, usecols=["latitude", "longitude", "analysis_neighborhood", "units"])
+    parcels = parcels.dropna(subset=["latitude", "longitude", "analysis_neighborhood"]).reset_index(drop=True)
+    units = parcels.groupby("analysis_neighborhood")["units"].sum()
+    table = pd.read_csv(table_path).set_index("analysis_neighborhood") if table_path else None
+    if table is not None and "residential_units" in table.columns:
+        units = table["residential_units"].dropna().combine_first(units)
+    if incidents_path:
+        inc = pd.read_csv(incidents_path, usecols=["Incident Date", "Incident Category", "Analysis Neighborhood"],
+                          low_memory=False)
+        inc["when"] = pd.to_datetime(inc["Incident Date"], errors="coerce")
+        inc = inc.dropna(subset=["when", "Analysis Neighborhood"])
+        end = inc["when"].max()
+        start = end - pd.DateOffset(years=1)
+        win = inc[(inc["when"] > start) & (inc["when"] <= end)]
+        cat, hood = win["Incident Category"], win["Analysis Neighborhood"]
+        viol = win[cat.isin(VIOLENT_CATEGORIES)].groupby("Analysis Neighborhood").size()
+        prop = win[cat.isin(PROPERTY_CATEGORIES)].groupby("Analysis Neighborhood").size()
+        rates = pd.DataFrame({"units": units})
+        rates["violent"] = viol.reindex(rates.index).fillna(0) / rates["units"] * 1000
+        rates["property"] = prop.reindex(rates.index).fillna(0) / rates["units"] * 1000
+        period = f"{(start + pd.Timedelta(days=1)).date()} to {end.date()}"
+        source = (f"SFPD incident reports, {len(win)} geocoded-to-neighborhood incidents in the 12 months to "
+                  f"{end.date()}; residential units from the assessor / crime_neighborhood table")
+    else:
+        if table is None:
+            sys.exit("Crime data needs --crime-table (crime_neighborhood.csv) or --incidents (raw SFPD incident file).")
+        need = {"violent_per_1000_units", "property_per_1000_units"}
+        if not need <= set(table.columns):
+            sys.exit(f"{table_path} needs the columns {sorted(need)}.")
+        rates = pd.DataFrame({"units": units, "violent": table["violent_per_1000_units"],
+                              "property": table["property_per_1000_units"]})
+        period = "trailing 12 months, as supplied in the table"
+        source = f"{table_path.replace(chr(92), '/').split('/')[-1]} (violent / property incidents per 1,000 residential units)"
+    dropped = [f"{h} ({'no unit count' if pd.isna(r['units']) else str(int(r['units'])) + ' units'})"
+               for h, r in rates.iterrows() if pd.isna(r["units"]) or r["units"] < MIN_HOOD_UNITS
+               or pd.isna(r["violent"]) or pd.isna(r["property"])]
+    rates = rates.dropna()
+    rates = rates[rates["units"] >= MIN_HOOD_UNITS]
+    return dict(rates=rates, period=period, source=source, dropped=dropped,
+                parcels=parcels[["latitude", "longitude", "analysis_neighborhood"]])
+
+
+def _assign_hoods(crime, lat, lon):
+    """Neighborhood of each point = neighborhood of the nearest assessor parcel (NaN when none within
+    MAX_PARCEL_M, no coordinates, or the neighborhood has no rate)."""
+    from sklearn.neighbors import BallTree
+    p = crime["parcels"]
+    tree = BallTree(np.radians(p[["latitude", "longitude"]].values), metric="haversine")
+    lat, lon = pd.Series(lat, dtype=float), pd.Series(lon, dtype=float)
+    ok = (lat.notna() & lon.notna()).values
+    out = pd.Series(np.nan, index=lat.index, dtype=object)
+    if ok.any():
+        dist, idx = tree.query(np.radians(np.column_stack([lat.values[ok], lon.values[ok]])), k=1)
+        names = p["analysis_neighborhood"].values[idx[:, 0]].astype(object)
+        names[dist[:, 0] * 6371000.0 > MAX_PARCEL_M] = np.nan
+        out[ok] = names
+    return out.where(out.isin(crime["rates"].index))
+
+
+def _add_crime(core, d, crime):
+    """Append the two crime columns to `core`. A building without a usable neighborhood gets the
+    average of the training buildings in its zip (else of all buildings)."""
+    b = d.groupby("listing_key").agg(lat=("latitude", "first"), lon=("longitude", "first"), zip=("zip_code", "first"))
+    hood = _assign_hoods(crime, b["lat"], b["lon"])
+    r = crime["rates"]
+    bf = pd.DataFrame({"crime_violent": np.log1p(hood.map(r["violent"]).astype(float)),
+                       "crime_property": np.log1p(hood.map(r["property"]).astype(float))}, index=b.index)
+    known = bf["crime_violent"].notna()
+    zip_mean = bf[known].groupby(b["zip"][known]).mean()
+    overall = bf[known].mean()
+    for c in CRIME_FEATURES:
+        bf[c] = bf[c].fillna(b["zip"].map(zip_mean[c])).fillna(overall[c])
+    feats = bf.reindex(d["listing_key"].values)
+    feats.index = d.index
+    info = dict(n_buildings_with_neighborhood=int(known.sum()), n_buildings_default=int((~known).sum()),
+                neighborhoods_in_training=sorted(set(hood.dropna())),
+                zip_default={str(z): {c: round(float(v[c]), 4) for c in CRIME_FEATURES} for z, v in zip_mean.iterrows()},
+                overall={c: round(float(overall[c]), 4) for c in CRIME_FEATURES})
+    return pd.concat([core, feats[CRIME_FEATURES]], axis=1), info
+
+
+def _units_design(d, crime=None):
     """Core variables, penalized variables (zip effects + amenities) and the metadata
     the prediction function needs."""
     toks = d["amenities"].map(_tokens)
@@ -1159,11 +1266,14 @@ def _units_design(d):
     dist = dist.fillna(dist.groupby(d["zip_code"]).transform("mean")).fillna(dist.mean())
     core = pd.DataFrame({"beds": d["beds"], "baths": d["baths"], "log_sqft": np.log(d["sqft"]),
                          "dist_km": dist})
+    crime_meta = None
+    if crime is not None:
+        core, crime_meta = _add_crime(core, d, crime)
     pen = pd.concat([Z, A], axis=1)
     meta = dict(amenities=list(A.columns), skipped=skipped, zip_groups=zgroups, shares=shares,
                 zip_dist={str(z): round(float(v), 3) for z, v in dist.groupby(d["zip_code"]).mean().items()},
                 beds_counts={str(int(b)): int(n) for b, n in d["beds"].round().value_counts().sort_index().items()},
-                n_buildings=int(bld.nunique()), n_amen_unknown=int((~known).sum()))
+                n_buildings=int(bld.nunique()), n_amen_unknown=int((~known).sum()), crime=crime_meta)
     return core, pen, meta
 
 
@@ -1223,6 +1333,8 @@ def _metrics(pred, act, w):
     res = np.log(act) - np.log(pred)
     lg = np.log(act)
     return dict(rmse=float(np.sqrt(np.mean(e ** 2))), mae=float(ae.mean()), mape=float((ae / act).mean() * 100),
+                rmse_pct=float(np.sqrt(np.mean(e ** 2)) / act.mean() * 100),   # RMSE as % of the average actual rent
+                rmspe=float(np.sqrt(np.mean((e / act) ** 2)) * 100),            # root-mean-squared percentage error
                 r2=float(1 - np.sum(e ** 2) / np.sum((act - act.mean()) ** 2)),
                 rmse_log=float(np.sqrt(np.mean(res ** 2))),
                 r2_log=float(1 - np.sum(res ** 2) / np.sum((lg - lg.mean()) ** 2)),
@@ -1284,18 +1396,21 @@ def _u_holdout(C, P, y, w, groups, raw_w):
     return res
 
 
-def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=None):
+def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=None, crime=None):
     d, steps = clean_units(raw)
     steps = list(extra_steps or []) + steps
     n = len(d)
     if n < 100 or d["listing_key"].nunique() < 20:
         sys.exit(f"Only {n} usable rows in {d['listing_key'].nunique()} buildings; too few for this model.")
-    core, pen, meta = _units_design(d)
+    core, pen, meta = _units_design(d, crime)
     C, P = core.values, pen.values
     y, w, groups = np.log(d["rent"].values), d["w"].values, d["listing_key"].values
 
     cv = _u_outer_cv(C, P, y, w, groups, w)
     ho = _u_holdout(C, P, y, w, groups, w)
+    cv0 = None
+    if crime is not None:      # same validation without the crime columns, for an honest before/after
+        cv0 = _u_outer_cv(core.drop(columns=CRIME_FEATURES).values, P, y, w, groups, w)
     curve = np.mean([_u_cv_curve(C, P, y, w, groups, 10, 1, 200 + s) for s in range(SELECT_REPEATS)], axis=0)
     j = int(np.argmin(curve)) if penalty_fraction is None else int(np.argmin(np.abs(RATIOS - penalty_fraction)))
     beta, gam = _u_path(C, P, y, w, RATIOS[[j]])
@@ -1321,7 +1436,8 @@ def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=
     freq = (gg != 0).mean(axis=0)
 
     coefs = {}
-    for k, name in enumerate(CORE):
+    core_cols = list(core.columns)
+    for k, name in enumerate(core_cols):
         coefs[name] = {"coef": round(float(beta[k + 1]), 5), "ci95": [round(float(blo[k + 1]), 5), round(float(bhi[k + 1]), 5)]}
     pcols = list(pen.columns)
     for k, name in enumerate(pcols):
@@ -1334,7 +1450,7 @@ def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=
          for k, v in {"p10": .1, "p25": .25, "p75": .75, "p90": .9}.items()}
     sc = cv["scores"]
     improvement = (sc["median"]["mae"] - sc["lasso"]["mae"]) / sc["median"]["mae"] * 100
-    means = {c: round(float(np.average(core[c], weights=w)), 5) for c in CORE}
+    means = {c: round(float(np.average(core[c], weights=w)), 5) for c in core_cols}
     src = pd.DataFrame({"source": d["source"], "res": resid})
     source_check = {s: dict(units=int(len(g)), buildings=int(d.loc[g.index, "listing_key"].nunique()),
                             mean_log_residual=round(float(g["res"].mean()), 4))
@@ -1352,6 +1468,14 @@ def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=
         "Asking rents from available units, not signed leases; fees and concessions are not modeled. "
         "Scope: apartments and condos with up to 4 bedrooms inside San Francisco.",
     ]
+    if crime is not None:
+        caveats.append(
+            "Crime enters as two neighborhood-level rates (violent and property incidents per 1,000 residential "
+            "units). They are associations measured across a few dozen neighborhoods, not the price of crime at an "
+            "address, and a building with no neighborhood input gets its zip's average. The violent and property rates "
+            "move together across neighborhoods (correlation about 0.8), so their coefficients have opposite signs and "
+            "only the net effect should be read (effects['crime_net_pct_if_both_rates_double']). Neighborhood crime can act "
+            "as a stand-in for who lives in an area: have compliance / legal review before using it in pricing.")
     thin = [k + "-bed" for k, v in meta["beds_counts"].items() if v < 30]
     if thin:
         caveats.append(f"Very few {', '.join(thin)} units in the training data: estimates for those sizes are not reliable.")
@@ -1360,6 +1484,22 @@ def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=
     reliability = (f"moderate: typical out-of-building error about {sc['lasso']['mape']:.0f}% per listing "
                    f"(plain median: {sc['median']['mape']:.0f}%); cross-validated R2 on log rent {sc['lasso']['r2_log']:.2f}")
     rnd = lambda m: {k: round(v, 3 if k.startswith(("r2", "rmse_log")) else 1) for k, v in m.items()}  # noqa: E731
+    crime_info = crime_params = None
+    if crime is not None:
+        cm = meta["crime"]
+        crime_info = dict(features=CRIME_FEATURES, period=crime["period"], source=crime["source"],
+                          definition="log(1 + incidents per 1,000 residential units) in the building's neighborhood",
+                          violent_categories=sorted(VIOLENT_CATEGORIES), property_categories=sorted(PROPERTY_CATEGORIES),
+                          buildings_with_neighborhood=cm["n_buildings_with_neighborhood"],
+                          buildings_using_zip_average=cm["n_buildings_default"],
+                          neighborhoods_without_rate=crime["dropped"],
+                          cross_validated_without_crime=rnd(cv0["scores"]["lasso"]))
+        crime_params = dict(
+            features=CRIME_FEATURES, period=crime["period"], source=crime["source"],
+            neighborhoods={h: dict(violent_per_1000_units=round(float(r["violent"]), 1),
+                                   property_per_1000_units=round(float(r["property"]), 1))
+                           for h, r in crime["rates"].iterrows()},
+            zip_default=cm["zip_default"], overall=cm["overall"])
     info = dict(trained=str(datetime.date.today()), source=source_label,
                 method="lasso (L1), penalty by grouped cross-validation",
                 penalty_fraction_of_max=round(float(RATIOS[j]), 4),
@@ -1373,14 +1513,15 @@ def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=
                 validation=dict(
                     design=f"10-fold cross-validation holding out whole buildings, repeated {CV_REPEATS}x; "
                            "the penalty is re-chosen (5-fold, buildings held out) inside every fold",
-                    cross_validated=dict(lasso=rnd(sc["lasso"]), beds_baths_sqft_distance_only=rnd(sc["core"]),
+                    core_variables=("beds, baths, sqft, distance" + (", crime" if crime is not None else "")),
+                    cross_validated=dict(lasso=rnd(sc["lasso"]), core_variables_only=rnd(sc["core"]),
                                          plain_median=rnd(sc["median"])),
                     holdout_test=dict(
                         design=f"{int(HOLDOUT_FRACTION * 100)}% of buildings (random, seed {HOLDOUT_SEED}) set aside; "
                                "model and penalty fit on the other buildings only; test buildings scored once",
                         **{k: (rnd(v) if isinstance(v, dict) else v) for k, v in ho.items()}),
                     mae_improvement_over_median_pct=round(improvement, 1)),
-                reliability=reliability, caveats=caveats)
+                reliability=reliability, caveats=caveats, crime=crime_info)
     params = dict(
         info=info, const=round(float(beta[0]), 5), coefs=coefs,
         amenity_share_yes={c: round(meta["shares"][c], 3) for c in kept_amen},
@@ -1391,7 +1532,7 @@ def fit_units(raw, source_label, penalty_fraction=None, extra_steps=None, files=
                      zips=sorted(d["zip_code"].unique().tolist()),
                      rent=[float(d["rent"].min()), float(d["rent"].max())]),
         zip_groups=[f"zip_{z}" for z in meta["zip_groups"]], zip_distance_km=meta["zip_dist"],
-        screen=dict(skipped=meta["skipped"]),
+        screen=dict(skipped=meta["skipped"]), crime=crime_params,
         _report=dict(curve=(curve, j), cv=cv, holdout=ho, candidates=pcols, n_amen=len(meta["amenities"])))
     return params, steps
 
@@ -1404,7 +1545,7 @@ def report_units(p, steps):
     for f in i["files"]:
         print(f"  {f['file']}: {f['rows_read']} rows read, {f['rows_after_dedup']} after removing duplicates")
     print(f"lasso over {len(r['candidates'])} penalized variables ({r['n_amen']} amenities + zip effects); "
-          f"unpenalized: beds, baths, log(sqft), distance to downtown")
+          f"unpenalized: beds, baths, log(sqft), distance to downtown" + (", violent and property crime rate" if i.get("crime") else ""))
     gain = (1 - r["curve"][0][r["curve"][1]] / r["curve"][0][0]) * 100
     print(f"penalty = {i['penalty_fraction_of_max']:.3f} of the penalty that zeroes everything "
           f"(chosen by grouped cross-validation; versus dropping every zip and amenity term it lowers "
@@ -1414,15 +1555,25 @@ def report_units(p, steps):
     print(f"\nTEST SET ({h['design']}):")
     print(f"  {h['n_train_buildings']} training buildings ({h['n_train_units']} units), "
           f"{h['n_test_buildings']} test buildings ({h['n_test_units']} units)")
-    for nm, key in (("lasso", "lasso"), ("beds+baths+sqft+distance only", "core"), ("plain median", "median")):
+    for nm, key in (("lasso", "lasso"), (v["core_variables"] + " only", "core"), ("plain median", "median")):
         m = h[key]
-        print(f"  {nm:<31} test RMSE ${m['rmse']:>6,.0f}   MAE ${m['mae']:>6,.0f} ({m['mape']:.1f}%)   R2 {m['r2']:.2f} (log {m['r2_log']:.2f})")
+        print(f"  {nm:<31} test RMSE ${m['rmse']:>6,.0f} = {m['rmse_pct']:.1f}% of avg rent (RMSPE {m['rmspe']:.1f}%)   "
+              f"MAE ${m['mae']:>6,.0f} ({m['mape']:.1f}%)   R2 {m['r2']:.2f} (log {m['r2_log']:.2f})")
     cvs = v["cross_validated"]
     print(f"\nrepeated cross-validation, whole buildings held out ({v['design']}):")
-    for nm, key in (("lasso", "lasso"), ("beds+baths+sqft+distance only", "beds_baths_sqft_distance_only"), ("plain median", "plain_median")):
+    for nm, key in (("lasso", "lasso"), (v["core_variables"] + " only", "core_variables_only"), ("plain median", "plain_median")):
         m = cvs[key]
-        print(f"  {nm:<31} RMSE ${m['rmse']:>6,.0f}   MAE ${m['mae']:>6,.0f} ({m['mape']:.1f}%)   R2 {m['r2']:.2f} (log {m['r2_log']:.2f})   "
-              f"building-weighted RMSE ${m['w_rmse']:,.0f}")
+        print(f"  {nm:<31} RMSE ${m['rmse']:>6,.0f} = {m['rmse_pct']:.1f}% of avg rent (RMSPE {m['rmspe']:.1f}%)   "
+              f"MAE ${m['mae']:>6,.0f} ({m['mape']:.1f}%)   R2 {m['r2']:.2f} (log {m['r2_log']:.2f})")
+    if i.get("crime"):
+        c0, c1 = i["crime"]["cross_validated_without_crime"], cvs["lasso"]
+        print(f"\nCRIME EFFECT (same cross-validation, lasso with vs without the two crime rates):")
+        print(f"  without crime  RMSE ${c0['rmse']:>6,.0f} = {c0['rmse_pct']:.1f}%   MAE ${c0['mae']:>6,.0f} ({c0['mape']:.1f}%)   R2 {c0['r2']:.3f} (log {c0['r2_log']:.3f})")
+        print(f"  with crime     RMSE ${c1['rmse']:>6,.0f} = {c1['rmse_pct']:.1f}%   MAE ${c1['mae']:>6,.0f} ({c1['mape']:.1f}%)   R2 {c1['r2']:.3f} (log {c1['r2_log']:.3f})")
+        print(f"  crime period {i['crime']['period']}; {i['crime']['buildings_with_neighborhood']} buildings placed in a neighborhood, "
+              f"{i['crime']['buildings_using_zip_average']} use their zip's average")
+        if i["crime"]["neighborhoods_without_rate"]:
+            print("  neighborhoods without a rate: " + "; ".join(i["crime"]["neighborhoods_without_rate"]))
     print(f"R2 on log rent: in-sample {i['r2_in_sample']} (building-weighted) / {i['r2_in_sample_unit_weighted']} (per unit); "
           f"cross-validated {i['r2_cross_validated']}")
     print("\nmean in-sample log residual by source file (near 0 = the pooled sources agree):")
@@ -1447,6 +1598,7 @@ Standard library only. Drop this file next to app.py and:
 
     import rent_model
     r = rent_model.predict_rent(bedrooms=1, bathrooms=1, sqft=700, zip_code="94107",
+                                neighborhood="South of Market",
                                 amenities={"in_unit_laundry": True, "gym": False})
     r["estimate"], r["low"], r["high"], r["warnings"]
 
@@ -1480,6 +1632,9 @@ PRICE_MODEL = {
     "support": @@SUPPORT@@,
     "zip_groups": @@ZIP_GROUPS@@,  # zips with their own effect; other training zips share "zip_other"
     "zip_distance_km": @@ZIP_DIST@@,  # average distance to Union Square, used when no lat/lon is given
+    # Neighborhood crime rates (None when the model was trained without crime data). Neighborhood names are the
+    # keys of ["neighborhoods"]; use them for the app's dropdown.
+    "crime": @@CRIME@@,
 }
 
 VACANCY_MODEL = {
@@ -1495,12 +1650,15 @@ def _dist_km(lat, lon):
 
 
 def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenities=None,
-                 latitude=None, longitude=None):
+                 latitude=None, longitude=None, neighborhood=None):
     """Return {"estimate", "low", "high", "effects", "reliability", "warnings"}.
 
     bedrooms: 0 = studio. amenities: a dict like {"in_unit_laundry": True, "gym": None}
     (None = not known) or a list of amenity names the building has. Give latitude and
     longitude if you have them; otherwise distance to downtown is taken from the zip.
+    neighborhood: an SF analysis neighborhood name (see PRICE_MODEL["crime"]["neighborhoods"]); it sets the
+    violent / property crime rates. Without it the zip's average rate is used, which carries much less of
+    the crime effect.
     low/high are the 10th/90th percentile of out-of-building errors, so about 80% of
     held-out listings fell inside that range.
     """
@@ -1537,6 +1695,22 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
         dist = None
     inputs = {"beds": bedrooms, "baths": bathrooms, "log_sqft": math.log(sqft) if sqft else None,
               "dist_km": dist}
+    crime = pm.get("crime")
+    hood_used = None
+    if crime:
+        names = {h.lower(): h for h in crime["neighborhoods"]}
+        if neighborhood is not None:
+            hood_used = names.get(str(neighborhood).strip().lower())
+            if hood_used is None:
+                warnings.append(f"neighborhood '{neighborhood}' has no crime rate in this model; using the zip average")
+        if hood_used is not None:
+            r = crime["neighborhoods"][hood_used]
+            inputs["crime_violent"] = math.log1p(r["violent_per_1000_units"])
+            inputs["crime_property"] = math.log1p(r["property_per_1000_units"])
+        else:
+            if neighborhood is None:
+                warnings.append("no neighborhood given; using the average crime rate of training buildings in this zip")
+            inputs.update(crime["zip_default"].get(z, crime["overall"]))
     if isinstance(amenities, dict):
         flags = {k: (None if v is None else bool(v)) for k, v in amenities.items()}
     else:
@@ -1578,13 +1752,20 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
             effects["sqft_pct_per_10pct_larger"] = round((1.1 ** c["coef"] - 1) * 100, 1)
         elif name == "dist_km":
             effects["dist_pct_per_km_from_downtown"] = round((math.exp(c["coef"]) - 1) * 100, 1)
+        elif name in ("crime_violent", "crime_property"):
+            effects[name + "_pct_if_rate_doubles"] = round((2 ** c["coef"] - 1) * 100, 1)
         else:
             effects[name + "_pct"] = round((math.exp(c["coef"]) - 1) * 100, 1)
+    if "crime_violent" in coefs and "crime_property" in coefs:
+        # the two rates move together across neighborhoods (correlation about 0.8), so only their net effect is meaningful
+        effects["crime_net_pct_if_both_rates_double"] = round(
+            (2 ** (coefs["crime_violent"]["coef"] + coefs["crime_property"]["coef"]) - 1) * 100, 1)
     return {
         "estimate": round(est),
         "low": round(est * math.exp(q["p10"])),
         "high": round(est * math.exp(q["p90"])),
         "effects": effects,
+        "neighborhood_used": hood_used,
         "reliability": MODEL_INFO["reliability"],
         "warnings": warnings,
     }
@@ -1608,7 +1789,7 @@ def render_units(p):
         "@@SHARES@@": fmt(p["amenity_share_yes"]), "@@MEANS@@": fmt(p["means"]),
         "@@SMEAR@@": repr(p["smearing"]), "@@RESID_Q@@": fmt(p["resid_q"]),
         "@@SUPPORT@@": fmt(p["support"]), "@@ZIP_GROUPS@@": fmt(p["zip_groups"]),
-        "@@ZIP_DIST@@": fmt(p["zip_distance_km"]),
+        "@@ZIP_DIST@@": fmt(p["zip_distance_km"]), "@@CRIME@@": fmt(p.get("crime")),
     }.items():
         out = out.replace(key, val)
     return out
@@ -1629,12 +1810,26 @@ def main():
     ap.add_argument("--method", choices=["lasso", "subset"], default="lasso",
                     help="small hand-reviewed comps files only: lasso (default) or best-subset OLS chosen by "
                          "leave-one-out. Unit-level training files always use the lasso.")
+    ap.add_argument("--parcels", default=None,
+                    help="unit-level training only, enables the crime variables: assessor parcels CSV (properties.csv: "
+                         "latitude, longitude, analysis_neighborhood, units). Places each building in a neighborhood.")
+    ap.add_argument("--crime-table", default=None,
+                    help="crime_neighborhood.csv: residential_units and violent/property incidents per 1,000 units by "
+                         "neighborhood. Used for the rates themselves unless --incidents is also given.")
+    ap.add_argument("--incidents", default=None,
+                    help="optional raw SFPD incident file (Police_Department_Incident_Reports). Rates are recomputed "
+                         "from its latest 12 months. Large file (~200 MB): keep it out of git.")
     a = ap.parse_args()
+    crime = None
+    if a.parcels or a.crime_table or a.incidents:
+        if not a.parcels or not (a.crime_table or a.incidents):
+            sys.exit("Crime variables need --parcels plus --crime-table and/or --incidents.")
+        crime = load_crime(a.parcels, a.crime_table, a.incidents)
     if len(a.input) > 1:
         pool, pre_steps, files = load_pool(a.input)
         names = ", ".join(f["file"] for f in files)
         params, steps = fit_units(pool, f"{len(files)} files pooled and de-duplicated: {names}",
-                                  a.penalty_fraction, pre_steps, files)
+                                  a.penalty_fraction, pre_steps, files, crime)
         open(a.out, "w", encoding="utf-8").write(render_units(params))
         report_units(params, steps)
         print("\nwrote", a.out)
@@ -1644,11 +1839,13 @@ def main():
     if "asking_rent_usd_month" not in table.columns and UNITS_REQUIRED <= set(table.columns):
         label = path.replace("\\", "/").split("/")[-1]
         params, steps = fit_units(table, label + " (RealtyAPI available units; advertised asking rents)",
-                                  a.penalty_fraction)
+                                  a.penalty_fraction, crime=crime)
         open(a.out, "w", encoding="utf-8").write(render_units(params))
         report_units(params, steps)
         print("\nwrote", a.out)
         return
+    if crime is not None:
+        sys.exit("The crime variables are only available for unit-level RealtyAPI training files.")
     label = path.replace("\\", "/").split("/")[-1]
     if "asking_rent_usd_month" in table.columns:
         params, steps = fit_comps(table, label + " (RealtyAPI comps; advertised asking rents, hand-reviewed)",
