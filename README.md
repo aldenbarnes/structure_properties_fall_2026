@@ -13,6 +13,14 @@ streamlit run Code/rent_lookup_app.py
 
 Put the RealtyAPI key in `.streamlit/secrets.toml` as `REALTYAPI_KEY = "..."` (ignored by git), set the `REALTYAPI_KEY` environment variable, or paste it in the app's sidebar. On Streamlit Community Cloud, point the app at `Code/rent_lookup_app.py` and add the key under the app's Secrets settings.
 
+### Training data download
+`Code/download_training.py` builds a rolling training set. Each run searches apartments.com (via RealtyAPI) for San Francisco, skips every building already in `Data/training/queried_listings.csv`, and downloads details only for new buildings. The new rows go to a new dated file in `Data/training/`, and `Data/realty_training_combined.csv` is rebuilt from all of them. It has three added columns: `date_downloaded`, `days_since_download`, and `recency_weight` (0.5 at `--half-life` days old, default 90). See the docstring for details.
+
+```
+python Code/download_training.py --dry-run
+python Code/download_training.py --max-new 50
+```
+
 ### Crime features
 `Code/add_crime.py` reads `Data/realty_training.csv` and writes `Data/realty_training_with_extra.csv` with two added columns, `crime_pc1` (overall crime level) and `crime_pc2` (property crime vs. street violence). Both come from a PCA of `Data/crime_neighborhood.csv`, averaged over nearby neighborhoods with closer ones weighted more (see the docstring). The first run downloads DataSF's neighborhood boundaries to `Data/sf_analysis_neighborhoods.geojson`.
 
