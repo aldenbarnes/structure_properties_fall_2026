@@ -4,6 +4,7 @@
     python Code/download_training.py --max-requests 200
     python Code/download_training.py --dry-run        # search only: how many buildings would be requested
     python Code/download_training.py --combine-only   # rebuild the combined file, no API calls
+    python Code/download_training.py --reparse        # rebuild every run file from the saved raw responses
 
 Set REALTYAPI_KEY (or enter it at the hidden prompt). Standard library only; uses realty_lookup.
 
@@ -16,11 +17,10 @@ What a run does
                oldest first. Ones the cap doesn't reach keep their old rows and wait for a later run.
      Buildings downloaded more recently are never requested again, including ones that came back
      with no priced units. A building whose request failed is not logged, so it counts as new.
-  3. Requests /details/byid for each and pulls its units with realty_lookup.find_units, the same
-     parser the rent app uses.
+  3. Requests /details/byid for each and reads its units from detail.availabilities (see unit_rows).
   4. Writes the new rows to Data/training/realty_training_<date>.csv (a new file every run, never
-     overwriting earlier ones), the raw responses to Data/training/raw/byid_<date>.jsonl.gz, and
-     appends the buildings to queried_listings.csv.
+     overwriting earlier ones), the raw responses to Data/training/raw/byid_<date>.jsonl.gz (same
+     <date> part, e.g. 2026-10-28 or 2026-10-28_2), and appends the buildings to queried_listings.csv.
   5. Rebuilds Data/realty_training_combined.csv from every file in Data/training. A unit (or floor
      plan) downloaded more than once keeps only its newest row; units no longer listed when a
      building is refreshed keep their older rows, which recency_weight counts for less.
@@ -31,9 +31,8 @@ Columns
     days_since_download  days between date_downloaded and the day the combined file was built.
     recency_weight       0.5 ** (days_since_download / --half-life), so a row --half-life days old
                          counts half as much as one downloaded today. Recomputed on every rebuild.
-  rent_max and price_with_fees stay blank for new downloads: find_units only reads the low end of
-  the rent, and the fee-inclusive field has not been checked in a live response. The raw responses
-  are kept so these can be filled in later without new requests.
+  The raw responses are kept so a parsing fix can be applied to past runs with --reparse, without
+  new requests.
 
 Importing an earlier download (done once for the original file):
     python Code/download_training.py --import Data/realty_training.csv --date 2026-10-20
@@ -89,12 +88,20 @@ def run_files():
     return sorted(TRAINING_DIR.glob(RUN_PREFIX + "*.csv"))
 
 
-def new_run_path(stem, suffix):
-    """Data/training/<stem><suffix>, with _2, _3 ... added when a run already used today's name."""
-    path, n = TRAINING_DIR / (stem + suffix), 2
-    while path.exists():
-        path, n = TRAINING_DIR / "{}_{}{}".format(stem, n, suffix), n + 1
-    return path
+def run_path(stem):
+    return TRAINING_DIR / (RUN_PREFIX + stem + ".csv")
+
+
+def raw_path(stem):
+    return TRAINING_DIR / "raw" / ("byid_" + stem + ".jsonl.gz")
+
+
+def new_stem(day):
+    """The run name for `day`: the date, with _2, _3 ... added when a run already used it."""
+    stem, n = day, 2
+    while run_path(stem).exists() or raw_path(stem).exists():
+        stem, n = "{}_{}".format(day, n), n + 1
+    return stem
 
 
 def last_downloaded():
@@ -143,24 +150,89 @@ def search_all(client, location, log):
         page += 1
 
 
+# detail.propertyType -> the search's propertyType, for search results that leave it out.
+PROPERTY_TYPES = {"apartment community": "Apartment", "apartment unit for rent": "Apartment",
+                  "residential condo unit for rent": "Condo", "single-family home": "House", "townhome": "Townhouse"}
+
+
+def _money_range(text):
+    """"$3,641 - 3,741" -> (3641.0, 3741.0); "$3,641" -> (3641.0, 3641.0); "Call for Rent" -> (None, None)."""
+    nums = [float(x.replace(",", "")) for x in re.findall(r"\d[\d,]*(?:\.\d+)?", str(text or ""))]
+    return (min(nums), max(nums)) if nums else (None, None)
+
+
 def unit_rows(search_result, details, day):
-    """Training rows (COLUMNS) for one building: one per unit or floor plan that has a rent."""
+    """Training rows (COLUMNS) for one building: one per unit or floor plan that has a rent.
+
+    /details/byid lists them in detail.availabilities: groups ("All", "Studio", "1 Bed", ...) whose
+    "details" are floor plans (a model key "mk", no "uk") and units ("uk", with the "mk" of their
+    plan when they have one). "All" holds every entry, so only it is read. A floor plan becomes a
+    row only when none of its units are listed, so a unit is never counted twice. Rent is the low
+    end of rentRange ("Call for Rent" rows are skipped); price_with_fees is the low end of priceRange.
+    """
+    detail = details.get("detail") if isinstance(details.get("detail"), dict) else {}
+    groups = [g for g in detail.get("availabilities") or [] if isinstance(g, dict)]
+    entries = [x for g in groups if g.get("name") == "All" for x in g.get("details") or [] if isinstance(x, dict)]
+    if not entries:   # no "All" group: read every group, dropping repeats
+        seen = set()
+        for x in (x for g in groups for x in g.get("details") or [] if isinstance(x, dict)):
+            k = json.dumps(x, sort_keys=True)
+            if k not in seen:
+                seen.add(k)
+                entries.append(x)
+    plans_with_units = {x.get("mk") for x in entries if x.get("uk") and x.get("mk")}
     summary = rl.property_summary(search_result, details)
-    units = [u for u in rl.find_units(details) if u.get("rent") is not None]
+    ptype = search_result.get("propertyType") or PROPERTY_TYPES.get(str(detail.get("propertyType") or "").lower())
     amenities = "; ".join(n.strip() for n in search_result.get("amenityNames") or [] if isinstance(n, str) and n.strip())
-    rows = []
-    for u in units:
-        rows.append({
-            "listing_key": search_result["listingKey"], "level": u.get("level"), "unit_key": u.get("unit_key"),
-            "unit_number": u.get("unit"), "floor_plan": u.get("plan"), "rent": u["rent"], "rent_min": u["rent"],
-            "rent_max": None, "price_with_fees": None, "beds": u.get("beds"), "baths": u.get("baths"),
-            "sqft": u.get("sqft"), "available_date": u.get("available"), "rent_source": "detail_" + u.get("level", "unit"),
-            "name": summary["name"], "address": summary["address"], "zip_code": summary["zip_code"],
-            "latitude": summary["latitude"], "longitude": summary["longitude"],
-            "property_type": search_result.get("propertyType"), "amenities": amenities,
-            "units_in_listing": len(units), "weight": 1.0 / len(units), "date_downloaded": day,
+    units = []
+    for x in entries:
+        if not x.get("uk") and x.get("mk") in plans_with_units:
+            continue
+        rent_min, rent_max = _money_range(x.get("rentRange"))
+        if rent_min is None:
+            continue
+        level = "unit" if x.get("uk") else "floor_plan"
+        units.append({
+            "listing_key": search_result["listingKey"], "level": level, "unit_key": x.get("uk"),
+            "unit_number": x.get("unitNumber"), "floor_plan": x.get("modelName"), "rent": rent_min,
+            "rent_min": rent_min, "rent_max": rent_max, "price_with_fees": _money_range(x.get("priceRange"))[0],
+            "beds": rl._num(x.get("bedNum") if x.get("bedNum") not in (None, "") else x.get("beds"), beds=True),
+            "baths": rl._num(x.get("bathNum") if x.get("bathNum") not in (None, "") else x.get("baths")),
+            "sqft": rl._num(x.get("area")), "available_date": str(x.get("availabilityDate") or "")[:10] or None,
+            "rent_source": "detail_" + level, "name": summary["name"], "address": summary["address"],
+            "zip_code": summary["zip_code"], "latitude": summary["latitude"], "longitude": summary["longitude"],
+            "property_type": ptype, "amenities": amenities, "date_downloaded": day,
         })
-    return rows
+    for u in units:
+        u["units_in_listing"], u["weight"] = len(units), 1.0 / len(units)
+    return units
+
+
+def reparse():
+    """Rebuild each run file that has saved raw responses, and correct its buildings in the queried log."""
+    counts = {}
+    for raw in sorted((TRAINING_DIR / "raw").glob("byid_*.jsonl.gz")):
+        stem = raw.name[len("byid_"):-len(".jsonl.gz")]
+        day = stem.split("_")[0]
+        rows = []
+        with gzip.open(raw, "rt", encoding="utf-8") as f:
+            for line in f:
+                rec = json.loads(line)
+                units = unit_rows(rec["search_result"], rec["details"], day)
+                rows.extend(units)
+                counts[(rec["listing_key"], day)] = len(units)
+        if rows:
+            write_csv(run_path(stem), COLUMNS, rows)
+        elif run_path(stem).exists():
+            run_path(stem).unlink()
+        print("{}: {} rows".format(run_path(stem).name, len(rows)))
+    if QUERIED_PATH.exists():
+        log = read_csv(QUERIED_PATH)
+        for r in log:
+            n = counts.get((r["listing_key"], r["date_downloaded"]))
+            if n is not None and r["status"] != "imported":
+                r["units_found"], r["status"] = n, "ok" if n else "no_priced_units"
+        write_csv(QUERIED_PATH, QUERIED_COLUMNS, log)
 
 
 def _row_key(r):
@@ -197,7 +269,7 @@ def import_file(path, day):
         sys.exit("{} is missing training columns: {}".format(path, ", ".join(missing)))
     for r in rows:
         r["date_downloaded"] = day
-    out = new_run_path(RUN_PREFIX + day, ".csv")
+    out = run_path(new_stem(day))
     write_csv(out, COLUMNS, rows)
     counts = {}
     for r in rows:
@@ -235,10 +307,11 @@ def download(args):
         return 0
     todo = new + refresh
     rows, queried, errors = [], [], 0
-    raw_path = new_run_path("raw/byid_" + day, ".jsonl.gz")
-    raw_path.parent.mkdir(exist_ok=True)
+    stem = new_stem(day)
+    raw_file = raw_path(stem)
+    raw_file.parent.mkdir(exist_ok=True)
     try:
-        with gzip.open(raw_path, "wt", encoding="utf-8") as raw:
+        with gzip.open(raw_file, "wt", encoding="utf-8") as raw:
             for i, listing_key in enumerate(todo, 1):
                 try:
                     details = rl.details(client, listing_key)
@@ -261,13 +334,18 @@ def download(args):
         print("Interrupted; saving what was downloaded.")
     finally:
         if rows:
-            out = new_run_path(RUN_PREFIX + day, ".csv")
-            write_csv(out, COLUMNS, rows)
-            print("Wrote {} rows from {} buildings to {}".format(len(rows), len(queried), out))
-        if queried:
+            write_csv(run_path(stem), COLUMNS, rows)
+            print("Wrote {} rows from {} buildings to {}".format(len(rows), len(queried), run_path(stem)))
+        if len(queried) >= 10 and not rows:
+            # Every building empty means the response format changed, not that nothing is for rent.
+            # Leave them out of the log so the next run asks again; the raw file keeps the responses.
+            print("WARNING: none of the {} buildings had priced units, so they are not marked as downloaded. "
+                  "Check the parser against {} before running again.".format(len(queried), raw_file))
+            errors += 1
+        elif queried:
             append_queried(queried)
         else:
-            raw_path.unlink(missing_ok=True)
+            raw_file.unlink(missing_ok=True)
     total, kept = combine(args.half_life)
     print("Combined: {} rows ({} duplicates dropped) in {}".format(kept, total - kept, COMBINED_PATH))
     print("Requests used: {} (credits may differ). Errors: {}".format(client.requests, errors))
@@ -286,6 +364,8 @@ def main(argv=None):
                     help="days after which a row's recency_weight is 0.5 (default %(default)s)")
     ap.add_argument("--dry-run", action="store_true", help="search only; report how many buildings are new")
     ap.add_argument("--combine-only", action="store_true", help="rebuild the combined file without API calls")
+    ap.add_argument("--reparse", action="store_true",
+                    help="rebuild every run file from Data/training/raw, then the combined file (no API calls)")
     ap.add_argument("--import", dest="import_path", type=Path, help="add an earlier training CSV to Data/training")
     ap.add_argument("--date", help="with --import: the date that file was downloaded (YYYY-MM-DD)")
     args = ap.parse_args(argv)
@@ -296,6 +376,9 @@ def main(argv=None):
         if not args.date:
             ap.error("--import needs --date")
         import_file(args.import_path, date.fromisoformat(args.date).isoformat())
+        args.combine_only = True
+    if args.reparse:
+        reparse()
         args.combine_only = True
     if args.combine_only:
         total, kept = combine(args.half_life)
