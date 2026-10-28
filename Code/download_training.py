@@ -1,22 +1,29 @@
 """Rolling RealtyAPI training download: each run adds the San Francisco buildings not downloaded yet.
 
-    python Code/download_training.py                  # up to 50 new buildings (about 52 requests)
-    python Code/download_training.py --max-new 200
-    python Code/download_training.py --dry-run        # search only: how many new buildings there are
+    python Code/download_training.py                  # up to 1,000 requests
+    python Code/download_training.py --max-requests 200
+    python Code/download_training.py --dry-run        # search only: how many buildings would be requested
     python Code/download_training.py --combine-only   # rebuild the combined file, no API calls
 
 Set REALTYAPI_KEY (or enter it at the hidden prompt). Standard library only; uses realty_lookup.
 
 What a run does
   1. Pages through the apartments.com search for San Francisco (1 request per 500 results).
-  2. Skips every building (listing_key) already in Data/training/queried_listings.csv, so a
-     building is never requested twice, including ones that came back with no priced units.
-  3. Requests /details/byid for up to --max-new new buildings (1 request each) and pulls their
-     units with realty_lookup.find_units, the same parser the rent app uses.
+  2. Picks the buildings to request, 1 request each, until --max-requests (default 1,000, searches
+     included) is used up:
+       first   buildings never downloaded (not in Data/training/queried_listings.csv),
+       then    buildings whose latest download is more than --refresh-days (default 60) days old,
+               oldest first. Ones the cap doesn't reach keep their old rows and wait for a later run.
+     Buildings downloaded more recently are never requested again, including ones that came back
+     with no priced units. A building whose request failed is not logged, so it counts as new.
+  3. Requests /details/byid for each and pulls its units with realty_lookup.find_units, the same
+     parser the rent app uses.
   4. Writes the new rows to Data/training/realty_training_<date>.csv (a new file every run, never
      overwriting earlier ones), the raw responses to Data/training/raw/byid_<date>.jsonl.gz, and
      appends the buildings to queried_listings.csv.
-  5. Rebuilds Data/realty_training_combined.csv from every file in Data/training.
+  5. Rebuilds Data/realty_training_combined.csv from every file in Data/training. A unit (or floor
+     plan) downloaded more than once keeps only its newest row; units no longer listed when a
+     building is refreshed keep their older rows, which recency_weight counts for less.
 
 Columns
   The same columns as Data/realty_training.csv, plus:
@@ -51,6 +58,8 @@ COMBINED_PATH = DATA / "realty_training_combined.csv"
 RUN_PREFIX = "realty_training_"
 SEARCH_PAGE = 500
 HALF_LIFE_DAYS = 90
+REFRESH_DAYS = 60
+MAX_REQUESTS = 1000
 
 COLUMNS = ["listing_key", "level", "unit_key", "unit_number", "floor_plan", "rent", "rent_min", "rent_max",
            "price_with_fees", "beds", "baths", "sqft", "available_date", "rent_source", "name", "address",
@@ -88,12 +97,26 @@ def new_run_path(stem, suffix):
     return path
 
 
-def queried_keys():
-    """Every listing_key already requested: the queried log plus the rows of every run file."""
-    keys = {r["listing_key"] for r in read_csv(QUERIED_PATH)} if QUERIED_PATH.exists() else set()
-    for path in run_files():
-        keys |= {r["listing_key"] for r in read_csv(path)}
-    return keys
+def last_downloaded():
+    """{listing_key: latest date_downloaded} over the queried log and the rows of every run file."""
+    rows = read_csv(QUERIED_PATH) if QUERIED_PATH.exists() else []
+    rows += [r for path in run_files() for r in read_csv(path)]
+    latest = {}
+    for r in rows:
+        k, d = r["listing_key"], r["date_downloaded"]
+        if d > latest.get(k, ""):
+            latest[k] = d
+    return latest
+
+
+def plan_requests(found, latest, budget, refresh_days, today):
+    """(new, refresh): listing keys to request, new buildings first, then stale ones oldest first,
+    together at most `budget`."""
+    new = [k for k in found if k not in latest]
+    stale = sorted((k for k in found if k in latest and (today - date.fromisoformat(latest[k])).days > refresh_days),
+                   key=lambda k: latest[k])
+    new = new[:budget]
+    return new, stale[:budget - len(new)]
 
 
 def append_queried(rows):
@@ -191,19 +214,26 @@ def download(args):
     if not key:
         sys.exit("Set REALTYAPI_KEY, or run in a terminal for the hidden key prompt.")
     client = rl.Client(key, max_requests=args.max_requests)
-    day = date.today().isoformat()
-    known = queried_keys()
-    print("{} buildings already downloaded".format(len(known)))
+    today = date.today()
+    day = today.isoformat()
+    latest = last_downloaded()
+    print("{} buildings already downloaded".format(len(latest)))
     try:
         found = search_all(client, args.location, print)
     except rl.APIError as exc:
         sys.exit("Search failed: {}".format(exc))
-    todo = [k for k in found if k not in known]
-    print("{} buildings in the search, {} not downloaded yet".format(len(found), len(todo)))
+    budget = args.max_requests - client.requests
+    new, refresh = plan_requests(found, latest, budget, args.refresh_days, today)
+    n_new = sum(1 for k in found if k not in latest)
+    n_stale = sum(1 for k in found if k in latest and (today - date.fromisoformat(latest[k])).days > args.refresh_days)
+    print("{} buildings in the search: {} new, {} last downloaded over {} days ago".format(
+        len(found), n_new, n_stale, args.refresh_days))
+    print("This run: {} new and {} refreshes ({} requests left after the search); {} new and {} refreshes wait "
+          "for a later run".format(len(new), len(refresh), budget, n_new - len(new), n_stale - len(refresh)))
     if args.dry_run:
         print("Dry run: requests used {}".format(client.requests))
         return 0
-    todo = todo[:args.max_new]
+    todo = new + refresh
     rows, queried, errors = [], [], 0
     raw_path = new_run_path("raw/byid_" + day, ".jsonl.gz")
     raw_path.parent.mkdir(exist_ok=True)
@@ -221,11 +251,12 @@ def download(args):
                     continue   # not logged as queried, so the next run tries it again
                 raw.write(json.dumps({"listing_key": listing_key, "fetched_at": datetime.now(timezone.utc).isoformat(),
                                       "search_result": found[listing_key], "details": details}) + "\n")
-                new = unit_rows(found[listing_key], details, day)
-                rows.extend(new)
-                queried.append({"listing_key": listing_key, "date_downloaded": day, "units_found": len(new),
-                                "status": "ok" if new else "no_priced_units"})
-                print("{}/{} {}: {} units".format(i, len(todo), listing_key, len(new)))
+                units = unit_rows(found[listing_key], details, day)
+                rows.extend(units)
+                queried.append({"listing_key": listing_key, "date_downloaded": day, "units_found": len(units),
+                                "status": "ok" if units else "no_priced_units"})
+                print("{}/{} {}{}: {} units".format(i, len(todo), listing_key,
+                                                    " (refresh)" if listing_key in latest else "", len(units)))
     except KeyboardInterrupt:
         print("Interrupted; saving what was downloaded.")
     finally:
@@ -246,8 +277,11 @@ def download(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--location", default="San Francisco, CA")
-    ap.add_argument("--max-new", type=int, default=50, help="most new buildings to download this run (1 request each)")
-    ap.add_argument("--max-requests", type=int, default=100, help="hard cap on requests this run, searches included")
+    ap.add_argument("--max-requests", type=int, default=MAX_REQUESTS,
+                    help="cap on RealtyAPI requests this run, searches included (default %(default)s)")
+    ap.add_argument("--refresh-days", type=int, default=REFRESH_DAYS,
+                    help="re-download a building once its latest download is more than this many days old "
+                         "(default %(default)s), after all new buildings")
     ap.add_argument("--half-life", type=float, default=HALF_LIFE_DAYS,
                     help="days after which a row's recency_weight is 0.5 (default %(default)s)")
     ap.add_argument("--dry-run", action="store_true", help="search only; report how many buildings are new")
@@ -255,8 +289,8 @@ def main(argv=None):
     ap.add_argument("--import", dest="import_path", type=Path, help="add an earlier training CSV to Data/training")
     ap.add_argument("--date", help="with --import: the date that file was downloaded (YYYY-MM-DD)")
     args = ap.parse_args(argv)
-    if min(args.max_new, args.max_requests) < 1 or args.half_life <= 0:
-        ap.error("--max-new, --max-requests and --half-life must be positive")
+    if args.max_requests < 1 or args.refresh_days < 0 or args.half_life <= 0:
+        ap.error("--max-requests and --half-life must be positive, --refresh-days not negative")
     TRAINING_DIR.mkdir(parents=True, exist_ok=True)
     if args.import_path:
         if not args.date:
