@@ -1,7 +1,9 @@
 """SF rent lookup: find an apartment on RealtyAPI, pick the unit, edit any feature, get a rent estimate.
 
-The estimate is rent_model's prediction (size, location and the amenities its lasso kept, fit on SF
-listings) plus adjustments for other features taken from published studies (feature_adjustments.py).
+The estimate is the SF model's prediction (create_model_test.py: an average of ridge, SVM, KNN and
+gradient boosting fit on SF listings, using size, location, nearby rents, floor, condo vs apartment and
+building amenities) plus adjustments for other features taken from published studies
+(feature_adjustments.py).
 
 Run from the repo root:
 
@@ -18,9 +20,9 @@ import re
 import pandas as pd
 import streamlit as st
 
+import create_model_test as rent_model   # the SF model (Code/models/rent_blend.joblib)
 import feature_adjustments as fa
 import realty_lookup as rl
-import rent_model
 import sf_address
 
 try:
@@ -34,8 +36,9 @@ LAUNDRY = [fa.UNKNOWN, "None", "Shared in building", "In-unit washer and dryer"]
 GARAGE = {"Shared garage space", "Assigned garage space", "Two or more spaces"}
 MATCH_METERS = 25            # a listing this close to the parcel (same street and side) is the building
 
-# Amenities rent_model prices (whatever its last training run kept), and the form input feeding each.
-MODEL_AMENITIES = list(rent_model.PRICE_MODEL["amenity_share_yes"])
+MODEL_INFO = rent_model.model_info()
+# Amenities the SF model prices (whatever its last training run kept), and the form input feeding each.
+MODEL_AMENITIES = list(MODEL_INFO["amenity_share_yes"])
 MODEL_FROM_CHECKBOX = {"air_conditioning": "Air conditioning", "dishwasher": "Dishwasher", "fireplace": "Fireplace",
                        "furnished": "Furnished", "gym": "Fitness center", "pool": "Pool",
                        "balcony_patio": "Private outdoor space", "elevator": "Elevator",
@@ -449,10 +452,10 @@ with st.sidebar:
                "Zillow), stopping at the first that finds the building, plus 1 to load apartments.com units. "
                "An apartments.com URL or listing key costs 1. Repeat lookups are cached.")
     st.divider()
-    st.caption("SF model: " + rent_model.MODEL_INFO["reliability"])
-    st.caption("Trained on {} units in {} buildings, weighted toward SoMa, Mission Bay and downtown; "
-               "read the warnings under each estimate.".format(rent_model.MODEL_INFO["n_used"],
-                                                               rent_model.MODEL_INFO["n_buildings"]))
+    st.caption("SF model: " + MODEL_INFO["reliability"] + ".")
+    st.caption("Trained {} on {} units in {} buildings, weighted toward SoMa, Mission Bay and downtown; "
+               "read the warnings under each estimate.".format(MODEL_INFO["trained"], MODEL_INFO["n_used"],
+                                                               MODEL_INFO["n_buildings"]))
     st.caption("Features the SF model doesn't measure (condition, views, pets, ...) are priced from published "
                "studies. See the breakdown under the estimate.")
 
@@ -608,7 +611,7 @@ if other:
 
 
 def model_amenity_inputs():
-    """rent_model amenity inputs from the form: True, False, or None for unknown."""
+    """SF model amenity inputs from the form: True, False, or None for unknown."""
     def box(key):
         return {YES: True, NO: False}.get(ss[key])
     out = {}
@@ -632,14 +635,20 @@ def run_estimate():
         notes.append("Latitude and longitude are only used together; distance to downtown was taken from the zip.")
         lat = lon = None
     amenities = model_amenity_inputs()
+    # The SF model prices condo vs apartment; other types are priced as an apartment plus the study premium.
+    ptype = ss.s_property_type
+    model_ptype = None if ptype == fa.UNKNOWN else ("Condo" if ptype == "Condo" else "Apartment")
+    # Units in the listing (a proxy for large managed buildings) is only known for apartments.com listings.
+    n_units = len(ss.units) if ss.details is not None and ss.units else None
     model = rent_model.predict_rent(
         bedrooms=ss.f_beds, bathrooms=ss.f_baths, sqft=ss.f_sqft, zip_code=ss.f_zip.strip() or None,
-        latitude=lat, longitude=lon, amenities=amenities)
+        latitude=lat, longitude=lon, amenities=amenities, floor=ss.f_floor, property_type=model_ptype,
+        units_in_listing=n_units)
     choices = {k: ss["s_" + k] for k in fa.SELECTS}
-    choices["floor"] = ss.f_floor
+    choices["floor"] = None   # the SF model prices the floor, so no study-based floor premium on top
     choices["features"] = {f for f in CHECKS if ss[ck(f)] == YES}
     choices["missing"] = {f for f in CHECKS if ss[ck(f)] == NO}
-    choices["skip"] = MODEL_PRICED
+    choices["skip"] = MODEL_PRICED | ({"property_type"} if ptype == "Condo" else set())
     adj = fa.adjust(model["estimate"], choices)
     i = ss.unit_idx
     listed = ss.units[i].get("rent") if ss.details is not None and 0 <= i < len(ss.units) else None
@@ -681,7 +690,8 @@ else:
     amen = ss.result["amenities"]
     has = [m.replace("_", " ") for m, v in amen.items() if v]
     unknown = [m.replace("_", " ") for m, v in amen.items() if v is None]
-    why = "Size, location and the amenities the SF model prices. With: {}.".format(", ".join(has) or "none")
+    why = ("Size, location, nearby rents, floor, condo vs apartment and the amenities the SF model prices. "
+           "With: {}.".format(", ".join(has) or "none"))
     if unknown:
         why += " Unknown (typical share assumed): {}.".format(", ".join(unknown))
     rel = model["reliability"]

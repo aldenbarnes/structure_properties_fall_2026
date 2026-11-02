@@ -1,8 +1,8 @@
-"""Rent adjustments for features rent_model does not estimate, using premiums from published studies.
+"""Rent adjustments for features the SF model does not estimate, using premiums from published studies.
 
-rent_model is fit on SF listings and prices size, location and the amenities its lasso kept
-(rent_model.MODEL_INFO["amenities_kept"]). The app passes those amenities to the model and skips
-them here (choices["skip"]). Everything else comes from outside research (see EFFECTS: each entry
+The SF model (create_model_test.py) is fit on SF listings and prices size, location, floor, condo vs
+apartment and the amenities its last training run kept (create_model_test.model_info()). The app
+passes those to the model and skips them here (choices["skip"], and no floor). Everything else comes from outside research (see EFFECTS: each entry
 has its sources and a caveat), so these adjustments are assumptions layered on top of the model.
 
     adj = feature_adjustments.adjust(model_estimate, choices)
