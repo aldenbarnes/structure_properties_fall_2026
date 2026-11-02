@@ -299,7 +299,7 @@ def adjustments(choices):
               "features": UNIT_FEATURES + BUILDING_FEATURES the unit has (answered Yes),
               "missing": features it is known not to have (answered No); anything in neither
                          set is unsure and gets no adjustment,
-              "skip": SELECTS keys and feature names rent_model already prices (no study premium)}
+              "skip": SELECTS keys and feature names the SF model already prices (no study premium)}
     """
     rows = []
     skip = choices.get("skip") or set()

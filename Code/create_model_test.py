@@ -4,7 +4,7 @@
 The model is an equal-weight average of four models of log rent: ridge regression, support vector
 regression (RBF kernel), k-nearest neighbors and gradient boosting (HistGradientBoostingRegressor).
 
-Working name while we test it; it replaces train_rent_model.py / rent_model.py. The app
+Working name while we test it; it replaced train_rent_model.py / rent_model.py. The app
 (rent_lookup_app.py) imports this file for predict_rent() and model_info(); training only runs
 when the file is executed as a script.
 
@@ -16,7 +16,7 @@ Usage (from the repo root):
     python Code/create_model_test.py --predict             # load the saved model and run a sample prediction
 
 What it does (follows test_models.ipynb):
-  1. Cleans the unit-level rows with the same filters as clean_units() in train_rent_model.py, plus the
+  1. Cleans the unit-level rows with the same filters as the old train_rent_model.py, plus the
      rent-per-sq-ft filter ($2-$12) the spreadsheet path used.
   2. Builds features: beds, baths, log(sqft), sq ft per bedroom, distance to downtown, map coordinates,
      zip, building amenities (an amenity needs 5 buildings with it and 5 without; an unknown amenity
@@ -567,7 +567,7 @@ def model_info(model_path=DEFAULT_OUT):
 def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenities=None,
                  latitude=None, longitude=None, floor=None, property_type=None, units_in_listing=None,
                  model_path=DEFAULT_OUT):
-    """Return {"estimate", "low", "high", "reliability", "warnings"}, the keys rent_model.predict_rent used.
+    """Return {"estimate", "low", "high", "reliability", "warnings"}, the keys the old rent_model.predict_rent used.
 
     amenities: a dict like {"in_unit_laundry": True, "gym": None} (None = not known) or a list of
     amenity names the building has. Unknown amenities get the share of buildings that have them.

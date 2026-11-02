@@ -236,7 +236,7 @@ def reparse():
 
 
 def _row_key(r):
-    """Same duplicate rule as train_rent_model.load_pool: a unit by its unit_key, otherwise a floor plan."""
+    """Same duplicate rule as the old train_rent_model.load_pool: a unit by its unit_key, otherwise a floor plan."""
     if r.get("unit_key"):
         return (r["listing_key"], "unit", r["unit_key"])
     return (r["listing_key"], "plan", r.get("floor_plan"), r.get("beds"), r.get("baths"), r.get("sqft"))
