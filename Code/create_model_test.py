@@ -4,8 +4,9 @@
 The model is an equal-weight average of four models of log rent: ridge regression, support vector
 regression (RBF kernel), k-nearest neighbors and gradient boosting (HistGradientBoostingRegressor).
 
-Working name while we test it; it will replace train_rent_model.py / rent_model.py.
-The app (rent_lookup_app.py) still uses rent_model.py and is not touched here.
+Working name while we test it; it replaces train_rent_model.py / rent_model.py. The app
+(rent_lookup_app.py) imports this file for predict_rent() and model_info(); training only runs
+when the file is executed as a script.
 
 Usage (from the repo root):
     pip install pandas numpy scikit-learn joblib
@@ -551,10 +552,22 @@ def load_model(path=DEFAULT_OUT):
     return _LOADED[path]
 
 
+def model_info(model_path=DEFAULT_OUT):
+    """What the app shows about the model: units and buildings trained on, a one-line reliability
+    note, and the amenities it prices (with the share of training buildings that have each)."""
+    b = load_model(model_path)
+    info, spec = b["info"], b["spec"]
+    cv = info["repeated_cv"]["results"]["average"]
+    reliability = ("average of ridge, SVM, KNN and gradient boosting; on buildings it had not seen, a typical "
+                   "error of about {:.0%} (RMSE ${:,.0f})".format(math.exp(cv["rmse_log"]) - 1, cv["rmse_usd"]))
+    return {"n_used": info["n_used"], "n_buildings": info["n_buildings"], "trained": info["trained"],
+            "reliability": reliability, "amenity_share_yes": dict(spec["amenity_share_yes"])}
+
+
 def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenities=None,
                  latitude=None, longitude=None, floor=None, property_type=None, units_in_listing=None,
                  model_path=DEFAULT_OUT):
-    """Return {"estimate", "low", "high", "warnings"}, the same keys rent_model.predict_rent uses.
+    """Return {"estimate", "low", "high", "reliability", "warnings"}, the keys rent_model.predict_rent used.
 
     amenities: a dict like {"in_unit_laundry": True, "gym": None} (None = not known) or a list of
     amenity names the building has. Unknown amenities get the share of buildings that have them.
@@ -631,7 +644,8 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
     q = b["log_residual_quantiles_by_beds"].get(str(int(round(row["beds"]))),
                                                 b["log_residual_quantiles_out_of_sample"])
     return {"estimate": round(est), "low": round(est * math.exp(q["p10"])),
-            "high": round(est * math.exp(q["p90"])), "warnings": warnings}
+            "high": round(est * math.exp(q["p90"])), "reliability": model_info(model_path)["reliability"],
+            "warnings": warnings}
 
 
 def main():
