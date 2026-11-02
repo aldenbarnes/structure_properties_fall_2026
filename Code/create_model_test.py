@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Train the SF rent stacking model and save it to Code/models/rent_stack.joblib.
+"""Train the SF rent model and save it to Code/models/rent_blend.joblib.
+
+The model is an equal-weight average of four models of log rent: ridge regression, support vector
+regression (RBF kernel), k-nearest neighbors and gradient boosting (HistGradientBoostingRegressor).
 
 Working name while we test it; it will replace train_rent_model.py / rent_model.py.
 The app (rent_lookup_app.py) still uses rent_model.py and is not touched here.
@@ -23,16 +26,16 @@ What it does (follows test_models.ipynb):
   3. Each base model gets the columns that suit it: ridge the dummies, KNN and SVM a short list of
      size and location, gradient boosting the raw map coordinates and zip as one categorical column.
   4. Training 1 (test): sets 20% of the buildings aside, tunes ridge, SVM, KNN and gradient boosting with
-     building-grouped 5-fold CV on the rest, stacks them (out-of-fold predictions from building-grouped
-     folds, blended by a non-negative linear regression) and reports the test RMSE of every model.
+     building-grouped 5-fold CV on the rest, averages them and reports the test RMSE of each model
+     and of the average.
   5. Repeated CV: with the tuned settings, 3 x 5-fold building-grouped CV over all buildings scores the
-     base models, the stack and a plain average. One 93-building test set is noisy; use these numbers
+     four models and their average. One ~90-building test set is noisy; use these numbers
      to compare versions. The out-of-fold errors also set the low/high range (by bedroom count).
-  6. Training 2 (final): refits the stack on every building with the tuned settings and saves it
+  6. Training 2 (final): refits all four models on every building with the tuned settings and saves it
      (compressed) with everything predict_rent() needs to rebuild the features from raw inputs.
 
 Weights: by default every building counts as 1 in total (as in the old lasso), so a 40-unit complex does
-not outweigh 40 small buildings. Ridge, SVM, gradient boosting and the blend use the weights; KNN cannot.
+not outweigh 40 small buildings. Ridge, SVM and gradient boosting use the weights; KNN cannot.
 RMSE is reported both per unit and per building (weighted).
 
 Rerun it whenever new data arrives; the previous model stays in git history.
@@ -48,9 +51,9 @@ import joblib
 import numpy as np
 import pandas as pd
 import sklearn
-from sklearn.base import BaseEstimator, TransformerMixin, clone
-from sklearn.ensemble import HistGradientBoostingRegressor, StackingRegressor
-from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin, clone
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
 from sklearn.metrics import make_scorer, mean_squared_error
 from sklearn.model_selection import GridSearchCV, GroupKFold, GroupShuffleSplit
 from sklearn.neighbors import KNeighborsRegressor
@@ -63,7 +66,7 @@ sklearn.set_config(enable_metadata_routing=True)   # lets sample weights reach t
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 DEFAULT_DATA = os.path.join(REPO, "Data", "realty_training_combined.csv")
-DEFAULT_OUT = os.path.join(HERE, "models", "rent_stack.joblib")
+DEFAULT_OUT = os.path.join(HERE, "models", "rent_blend.joblib")
 
 MIN_SQFT = 200            # smaller rows are shared-living rooms / non-standard units
 MAX_BEDS = 4              # larger homes are too few to model
@@ -369,18 +372,29 @@ def base_pipelines(model_cols, weighted):
     }
 
 
-def make_stack(base_models, X, groups, weighted):
-    """Out-of-fold base predictions from building-grouped folds, blended with a non-negative
-    linear regression."""
-    folds = list(GroupKFold(n_splits=N_FOLDS).split(X, groups=groups))
-    final = LinearRegression(positive=True).set_fit_request(sample_weight=weighted)
-    return StackingRegressor(estimators=[(n, clone(m)) for n, m in base_models.items()],
-                             final_estimator=final, cv=folds, n_jobs=-1)
+class AverageRegressor(BaseEstimator, RegressorMixin):
+    """Equal-weight average of the base models' predictions of log rent. Each model is fit with the
+    sample weights except KNN, which cannot take them."""
+
+    def __init__(self, models=None):
+        self.models = models
+
+    def fit(self, X, y, sample_weight=None):
+        self.models_ = {n: _fit(clone(m), X, y, None if n == "knn" or sample_weight is None
+                                else pd.Series(sample_weight))
+                        for n, m in self.models.items()}
+        return self
+
+    def predict_each(self, X):
+        return {n: m.predict(X) for n, m in self.models_.items()}
+
+    def predict(self, X):
+        return np.mean(list(self.predict_each(X).values()), axis=0)
 
 
 def _fit(model, X, y, w):
     """Fit with sample weights when there are any (w is None when every unit counts once)."""
-    return model.fit(X, y) if w is None else model.fit(X, y, sample_weight=w.values)
+    return model.fit(X, y) if w is None else model.fit(X, y, sample_weight=np.asarray(w))
 
 
 def _rmse(a, b, w=None):
@@ -403,9 +417,9 @@ def _group_folds(groups, k, seed):
 
 def repeated_cv(tuned, data, F, weighted, fit_w):
     """CV_REPEATS x N_FOLDS building-grouped CV with the tuned settings. Returns
-    (scores per model, out-of-fold stack predictions per repeat)."""
+    (scores per model, out-of-fold predictions of the average per repeat)."""
     X, y, g, wb = data[F], data["log_rent"], data["listing_key"], data["w_building"]
-    preds = {n: np.zeros((CV_REPEATS, len(y))) for n in list(tuned) + ["average", "stack"]}
+    preds = {n: np.zeros((CV_REPEATS, len(y))) for n in list(tuned) + ["average"]}
     for r in range(CV_REPEATS):
         for a, b in _group_folds(g, N_FOLDS, seed=100 + r):
             Xa, ya = X.iloc[a], y.iloc[a]
@@ -416,13 +430,12 @@ def repeated_cv(tuned, data, F, weighted, fit_w):
                 preds[n][r, b] = p
                 base.append(p)
             preds["average"][r, b] = np.mean(base, axis=0)
-            preds["stack"][r, b] = _fit(make_stack(tuned, Xa, g.iloc[a], weighted), Xa, ya, wa).predict(X.iloc[b])
     scores = {}
     for n, P in preds.items():
         per = [_scores(y, P[r], wb) for r in range(CV_REPEATS)]
         scores[n] = {k: float(np.mean([s[k] for s in per])) for k in per[0]}
         scores[n]["rmse_log_sd_across_repeats"] = float(np.std([s["rmse_log"] for s in per]))
-    return scores, preds["stack"]
+    return scores, preds["average"]
 
 
 def train(data_path, out_path, weights="building"):
@@ -460,20 +473,18 @@ def train(data_path, out_path, weights="building"):
         kw = {} if w_tr is None else {"sample_weight": w_tr.values}
         search.fit(X_tr, y_tr, groups=g_tr, **kw)
         pred = search.predict(X_te)
-        tuned[name] = search.best_estimator_
+        tuned[name] = clone(search.best_estimator_)   # settings only; the fitted copy is not kept
         test_results[name] = dict(cv_rmse_log=float(np.sqrt(-search.best_score_)), **_scores(y_te, pred, wb_te),
                                   best_params={k.split("__")[-1]: (v.item() if hasattr(v, "item") else v)
                                                for k, v in search.best_params_.items()})
         r = test_results[name]
         print(f"  {name:>5}: CV {r['cv_rmse_log']:.4f}  test {r['rmse_log']:.4f} (${r['rmse_usd']:,.0f})  "
               f"by building {r['rmse_log_by_building']:.4f}  {r['best_params']}")
-    stack = _fit(make_stack(tuned, X_tr, g_tr, weighted), X_tr, y_tr, w_tr)
-    pred = stack.predict(X_te)
-    test_results["stack"] = dict(**_scores(y_te, pred, wb_te),
-                                 blend={n: round(float(c), 3) for n, c in zip(tuned, stack.final_estimator_.coef_)})
-    r = test_results["stack"]
-    print(f"  stack: test {r['rmse_log']:.4f} (${r['rmse_usd']:,.0f})  "
-          f"by building {r['rmse_log_by_building']:.4f}  blend {r['blend']}")
+    pred = AverageRegressor(tuned).fit(X_tr, y_tr, sample_weight=w_tr).predict(X_te)
+    test_results["average"] = _scores(y_te, pred, wb_te)
+    r = test_results["average"]
+    print(f"  average of all 4: test {r['rmse_log']:.4f} (${r['rmse_usd']:,.0f})  "
+          f"by building {r['rmse_log_by_building']:.4f}")
 
     # ---- repeated CV over all buildings with the tuned settings ----
     print(f"\nrepeated CV ({CV_REPEATS} x {N_FOLDS}-fold by building, all {len(data)} units, tuned settings):")
@@ -482,7 +493,7 @@ def train(data_path, out_path, weights="building"):
         print(f"  {n:>7}: {s['rmse_log']:.4f} +/- {s['rmse_log_sd_across_repeats']:.4f}  (${s['rmse_usd']:,.0f})  "
               f"by building {s['rmse_log_by_building']:.4f} (${s['rmse_usd_by_building']:,.0f})")
 
-    # out-of-building residuals of the stack: exp() bias correction and the 80% range, by bedroom count
+    # out-of-building residuals of the average: exp() bias correction and the 80% range, by bedroom count
     resid = (data["log_rent"].values[None, :] - oof).ravel()
     beds = np.tile(data["beds"].round().astype(int).values, CV_REPEATS)
     smearing = float(np.mean(np.exp(resid)))
@@ -494,9 +505,8 @@ def train(data_path, out_path, weights="building"):
                     if (beds == b).sum() / CV_REPEATS >= MIN_BEDS_FOR_OWN_RANGE}
 
     # ---- training 2: tuned settings, refit on every building ----
-    print("\ntraining 2: refitting the stack on all buildings...")
-    final = _fit(make_stack(tuned, data[F], data["listing_key"], weighted), data[F], data["log_rent"], fit_w)
-    blend_all = {n: round(float(c), 3) for n, c in zip(tuned, final.final_estimator_.coef_)}
+    print("\ntraining 2: refitting all 4 models on all buildings...")
+    final = AverageRegressor(tuned).fit(data[F], data["log_rent"], sample_weight=fit_w)
 
     bundle = dict(
         model=final,
@@ -516,8 +526,7 @@ def train(data_path, out_path, weights="building"):
                       results=test_results),
             repeated_cv=dict(split=f"{CV_REPEATS} x {N_FOLDS}-fold building-grouped CV on all buildings "
                                    f"with the settings tuned in the test run", results=cv_results),
-            final_blend=blend_all,
-            final_intercept=float(final.final_estimator_.intercept_),
+            blend="equal-weight average of log rent from ridge, svm, knn and gbm",
             sklearn_version=sklearn.__version__,
             numpy_version=np.__version__,
             train_seconds=round((datetime.datetime.now() - t0).total_seconds()),
@@ -526,7 +535,6 @@ def train(data_path, out_path, weights="building"):
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     joblib.dump(bundle, out_path, compress=("xz", 9))
     size_kb = os.path.getsize(out_path) / 1024
-    print(f"final blend {blend_all}")
     print(f"saved {out_path} ({size_kb:,.0f} KB) in {bundle['info']['train_seconds']} s")
     return bundle
 
@@ -627,7 +635,7 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Train the SF rent stacking model")
+    ap = argparse.ArgumentParser(description="Train the SF rent model (average of 4 models)")
     ap.add_argument("--data", default=DEFAULT_DATA, help="unit-level training CSV (default %(default)s)")
     ap.add_argument("--out", default=DEFAULT_OUT, help="where to save the model (default %(default)s)")
     ap.add_argument("--weights", choices=["building", "unit"], default="building",
