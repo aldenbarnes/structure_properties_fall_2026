@@ -29,7 +29,8 @@ What it does (follows test_models.ipynb):
      The crime grid (Data/crime_grid.csv) is saved with the model so predict_rent() can look up
      crime for any latitude / longitude.
   3. Each base model gets the columns that suit it: ridge the dummies, KNN and SVM a short list of
-     size and location (SVM also crime), gradient boosting the raw map coordinates and zip as one categorical column.
+     size and location, gradient boosting the raw map coordinates and zip as one categorical column.
+     Ridge and SVM also get the crime columns; gradient boosting does not (it was worse with them).
   4. Training 1 (test): sets 20% of the buildings aside, tunes ridge, SVM, KNN and gradient boosting with
      building-grouped 5-fold CV on the rest, averages them and reports the test RMSE of each model
      and of the average.
@@ -354,7 +355,7 @@ def build_features(d, crime_grid):
         "ridge": CORE_COLS + NEARBY_COLS + EXTRA_COLS + CRIME_COLS + zcols + amen,
         "svm": CORE_COLS + LOCATION_COLS + NEARBY_COLS + EXTRA_COLS + CRIME_COLS + list(AMENITY_GROUPS),
         "knn": CORE_COLS + LOCATION_COLS + NEARBY_COLS,
-        "gbm": CORE_COLS + LOCATION_COLS + NEARBY_COLS + EXTRA_COLS + CRIME_COLS + amen + ["zip_cat"],
+        "gbm": CORE_COLS + LOCATION_COLS + NEARBY_COLS + EXTRA_COLS + amen + ["zip_cat"],   # crime made it worse
     }
     features = CORE_COLS + list(extra.columns) + zcols + amen   # what predict_rent() must supply
     data = pd.concat([core, extra, Z, A], axis=1)
