@@ -30,3 +30,9 @@ python Code/download_training.py
 pip install pandas numpy geopandas
 python Code/add_crime.py
 ```
+
+`Code/edit_training_data.py` does the same for `Data/realty_training_combined.csv`, writing `Data/realty_training_combined_final.csv` (the combined file plus `crime_pc1` and `crime_pc2`). Rerun it after each `download_training.py` run.
+
+```
+python Code/edit_training_data.py
+```
