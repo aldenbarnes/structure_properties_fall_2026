@@ -10,7 +10,8 @@ when the file is executed as a script.
 
 Usage (from the repo root):
     pip install pandas numpy scikit-learn joblib
-    python Code/create_model_test.py                       # trains on Data/realty_training_combined.csv
+    python Code/edit_training_data.py                      # first: adds the crime columns (needs geopandas)
+    python Code/create_model_test.py                       # trains on Data/realty_training_combined_final.csv
     python Code/create_model_test.py --weights unit        # every unit counts once instead of every building
     python Code/create_model_test.py --data other.csv --out Code/models/other.joblib
     python Code/create_model_test.py --predict             # load the saved model and run a sample prediction
@@ -21,11 +22,14 @@ What it does (follows test_models.ipynb):
   2. Builds features: beds, baths, log(sqft), sq ft per bedroom, distance to downtown, map coordinates,
      zip, building amenities (an amenity needs 5 buildings with it and 5 without; an unknown amenity
      list gets the share of buildings that have it, never "no"), floor (parsed from the unit number),
-     property type, units in the listing, a floor-plan flag, and "nearby rents": the average log rent
+     property type, units in the listing, a floor-plan flag, crime near the building (crime_pc1 /
+     crime_pc2 from edit_training_data.py) and "nearby rents": the average log rent
      per sq ft of the nearest OTHER buildings. Nearby rents are computed inside every fit from that
      fit's training rows only, so no held-out building ever sees its own rent.
+     The crime grid (Data/crime_grid.csv) is saved with the model so predict_rent() can look up
+     crime for any latitude / longitude.
   3. Each base model gets the columns that suit it: ridge the dummies, KNN and SVM a short list of
-     size and location, gradient boosting the raw map coordinates and zip as one categorical column.
+     size and location (SVM also crime), gradient boosting the raw map coordinates and zip as one categorical column.
   4. Training 1 (test): sets 20% of the buildings aside, tunes ridge, SVM, KNN and gradient boosting with
      building-grouped 5-fold CV on the rest, averages them and reports the test RMSE of each model
      and of the average.
@@ -66,7 +70,8 @@ sklearn.set_config(enable_metadata_routing=True)   # lets sample weights reach t
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-DEFAULT_DATA = os.path.join(REPO, "Data", "realty_training_combined.csv")
+DEFAULT_DATA = os.path.join(REPO, "Data", "realty_training_combined_final.csv")
+DEFAULT_CRIME_GRID = os.path.join(REPO, "Data", "crime_grid.csv")
 DEFAULT_OUT = os.path.join(HERE, "models", "rent_blend.joblib")
 
 MIN_SQFT = 200            # smaller rows are shared-living rooms / non-standard units
@@ -90,6 +95,7 @@ LOCATION_COLS = ["x_km", "y_km"]
 NEARBY_COLS = ["nearby_ppsf", "nearby_dist_km"]        # added inside each fit by NearbyRents
 EXTRA_COLS = ["sqft_per_bed", "floor", "floor_known", "condo", "ptype_unknown",
               "log_units_in_listing", "is_floor_plan"]
+CRIME_COLS = ["crime_pc1", "crime_pc2"]                # from edit_training_data.py
 TEST_FRACTION = 0.20
 SPLIT_SEED = 2026
 N_FOLDS = 5
@@ -253,7 +259,34 @@ def clean(df):
     return d, steps
 
 
-def build_features(d):
+def load_crime_grid(path=DEFAULT_CRIME_GRID):
+    """The crime grid from edit_training_data.py as dict(lat0, lon0, step, pc1, pc2), where pc1 / pc2
+    are 2-D arrays indexed [latitude row, longitude column]."""
+    g = pd.read_csv(path).sort_values(["latitude", "longitude"])
+    lats, lons = np.unique(g.latitude), np.unique(g.longitude)
+    shape = (len(lats), len(lons))
+    if len(g) != shape[0] * shape[1]:
+        sys.exit(f"{path} is not a full latitude x longitude grid")
+    return dict(lat0=float(lats[0]), lon0=float(lons[0]), step=float(np.diff(lats).mean()),
+                **{c: g[c].values.reshape(shape).astype(np.float32) for c in CRIME_COLS})
+
+
+def crime_at(grid, lat, lon):
+    """Bilinear interpolation of the crime grid at (lat, lon); points off the grid use its edge."""
+    n_lat, n_lon = grid["crime_pc1"].shape
+    r = np.clip((float(lat) - grid["lat0"]) / grid["step"], 0, n_lat - 1)
+    c = np.clip((float(lon) - grid["lon0"]) / grid["step"], 0, n_lon - 1)
+    r0, c0 = min(int(r), n_lat - 2), min(int(c), n_lon - 2)
+    fr, fc = r - r0, c - c0
+    out = {}
+    for k in CRIME_COLS:
+        a = grid[k]
+        out[k] = float((1 - fr) * ((1 - fc) * a[r0, c0] + fc * a[r0, c0 + 1])
+                       + fr * ((1 - fc) * a[r0 + 1, c0] + fc * a[r0 + 1, c0 + 1]))
+    return out
+
+
+def build_features(d, crime_grid):
     """Return (data table, feature spec). The spec holds what predict_rent() needs to
     rebuild the same columns from raw inputs."""
     toks = d["amenities"].map(_tokens)
@@ -311,14 +344,17 @@ def build_features(d):
         "is_floor_plan": (d["level"].astype(str) == "floor_plan").astype(float) if "level" in d else 0.0,
         "zip_cat": d["zip_code"].map(zip_codes).astype(float),
     }, index=d.index)
+    crime = d[CRIME_COLS].astype(float)
+    crime = crime.fillna(crime.mean())
+    extra = extra.join(crime)
 
     amen = list(A.columns)
     zcols = list(Z.columns)
     model_cols = {
-        "ridge": CORE_COLS + NEARBY_COLS + EXTRA_COLS + zcols + amen,
-        "svm": CORE_COLS + LOCATION_COLS + NEARBY_COLS + EXTRA_COLS + list(AMENITY_GROUPS),
+        "ridge": CORE_COLS + NEARBY_COLS + EXTRA_COLS + CRIME_COLS + zcols + amen,
+        "svm": CORE_COLS + LOCATION_COLS + NEARBY_COLS + EXTRA_COLS + CRIME_COLS + list(AMENITY_GROUPS),
         "knn": CORE_COLS + LOCATION_COLS + NEARBY_COLS,
-        "gbm": CORE_COLS + LOCATION_COLS + NEARBY_COLS + EXTRA_COLS + amen + ["zip_cat"],
+        "gbm": CORE_COLS + LOCATION_COLS + NEARBY_COLS + EXTRA_COLS + CRIME_COLS + amen + ["zip_cat"],
     }
     features = CORE_COLS + list(extra.columns) + zcols + amen   # what predict_rent() must supply
     data = pd.concat([core, extra, Z, A], axis=1)
@@ -343,6 +379,7 @@ def build_features(d):
         means={c: float(core[c].mean()) for c in CORE_COLS},
         floor_median=floor_median,
         units_median=units_median,
+        crime_grid=crime_grid,
         support=dict(beds=[float(d.beds.min()), float(d.beds.max())],
                      baths=[float(d.baths.min()), float(d.baths.max())],
                      sqft=[float(d.sqft.min()), float(d.sqft.max())],
@@ -439,17 +476,21 @@ def repeated_cv(tuned, data, F, weighted, fit_w):
     return scores, preds["average"]
 
 
-def train(data_path, out_path, weights="building"):
+def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME_GRID):
     t0 = datetime.datetime.now()
     weighted = weights == "building"
     raw = pd.read_csv(data_path)
+    missing = [c for c in CRIME_COLS if c not in raw]
+    if missing or not os.path.exists(crime_grid_path):
+        sys.exit(f"{data_path} has no {', '.join(missing) or 'crime grid'}; "
+                 "run Code/edit_training_data.py first (it writes the crime columns and Data/crime_grid.csv)")
     d, steps = clean(raw)
     print(f"read {len(raw)} rows from {data_path}")
     for name, n in steps:
         print(f"  dropped {n:>5}  {name}")
     print(f"kept {len(d)} units in {d['listing_key'].nunique()} buildings")
 
-    data, spec = build_features(d)
+    data, spec = build_features(d, load_crime_grid(crime_grid_path))
     F = spec["features"]
     fit_w = data["w_building"] if weighted else None
     print(f"{len(F)} columns ({len(spec['zip_columns'])} zip, {len(spec['amenities'])} amenity); "
@@ -611,6 +652,7 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
         "log_units_in_listing": math.log1p(units_in_listing if units_in_listing else spec["units_median"]),
         "is_floor_plan": 0.0,
         "zip_cat": float(spec["zip_codes"][z]) if z in spec["zip_codes"] else np.nan,
+        **crime_at(spec["crime_grid"], latitude, longitude),
     })
 
     for c in spec["zip_columns"]:
@@ -651,13 +693,14 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
 def main():
     ap = argparse.ArgumentParser(description="Train the SF rent model (average of 4 models)")
     ap.add_argument("--data", default=DEFAULT_DATA, help="unit-level training CSV (default %(default)s)")
+    ap.add_argument("--crime-grid", default=DEFAULT_CRIME_GRID, help="crime grid CSV (default %(default)s)")
     ap.add_argument("--out", default=DEFAULT_OUT, help="where to save the model (default %(default)s)")
     ap.add_argument("--weights", choices=["building", "unit"], default="building",
                     help="count every building once (default) or every unit once")
     ap.add_argument("--predict", action="store_true", help="skip training; load the saved model and run a sample")
     a = ap.parse_args()
     if not a.predict:
-        train(a.data, a.out, a.weights)
+        train(a.data, a.out, a.weights, a.crime_grid)
     if not os.path.exists(a.out):
         sys.exit(f"no model at {a.out}")
     sample = dict(bedrooms=1, bathrooms=1, sqft=700, zip_code="94107",
