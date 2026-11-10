@@ -44,6 +44,12 @@ not outweigh 40 small buildings. Ridge, SVM and gradient boosting use the weight
 RMSE is reported both per unit and per building (weighted).
 
 Rerun it whenever new data arrives; the previous model stays in git history.
+
+AI live-check rows (optional): a file from build_training_view.py has a data_source column
+("realtyapi_download" or "ai_audit") and a source_weight column. Building weights are multiplied by
+source_weight, so AI rows count for less, and every reported score (test set and repeated CV) is
+computed on the original rows only, so they stay comparable with a model trained without AI rows.
+Scores on the AI rows are reported separately. Without those columns nothing changes.
 """
 import argparse
 import datetime
@@ -95,6 +101,7 @@ LOCATION_COLS = ["x_km", "y_km"]
 NEARBY_COLS = ["nearby_ppsf", "nearby_dist_km"]        # added inside each fit by NearbyRents
 EXTRA_COLS = ["sqft_per_bed", "floor", "floor_known", "condo", "ptype_unknown",
               "log_units_in_listing", "is_floor_plan"]
+AI_SOURCE = "ai_audit"    # data_source of rows added by the AI live check (build_training_view.py)
 CRIME_COLS = ["crime_pc1", "crime_pc2"]                # from edit_training_data.py
 TEST_FRACTION = 0.20
 SPLIT_SEED = 2026
@@ -256,6 +263,8 @@ def clean(df):
     d = d.reset_index(drop=True)
     w = 1.0 / d.groupby("listing_key")["rent"].transform("size")
     d["w_building"] = w / w.groupby(d["listing_key"]).transform("sum")   # every building sums to 1
+    if "source_weight" in d:   # AI live-check rows count for less (build_training_view.py)
+        d["w_building"] *= pd.to_numeric(d["source_weight"], errors="coerce").fillna(1.0)
     return d, steps
 
 
@@ -362,6 +371,7 @@ def build_features(d, crime_grid):
     data["rent"] = d["rent"]
     data["listing_key"] = d["listing_key"]
     data["w_building"] = d["w_building"]
+    data["is_ai"] = (d["data_source"] == AI_SOURCE).values if "data_source" in d else False
 
     spec = dict(
         features=features,
@@ -455,7 +465,8 @@ def _group_folds(groups, k, seed):
 
 def repeated_cv(tuned, data, F, weighted, fit_w):
     """CV_REPEATS x N_FOLDS building-grouped CV with the tuned settings. Returns
-    (scores per model, out-of-fold predictions of the average per repeat)."""
+    (scores per model, out-of-fold predictions of the average per repeat). Scores use the original
+    rows only; AI live-check rows are trained on but scored separately (scores["average"]["ai_rows"])."""
     X, y, g, wb = data[F], data["log_rent"], data["listing_key"], data["w_building"]
     preds = {n: np.zeros((CV_REPEATS, len(y))) for n in list(tuned) + ["average"]}
     for r in range(CV_REPEATS):
@@ -468,11 +479,15 @@ def repeated_cv(tuned, data, F, weighted, fit_w):
                 preds[n][r, b] = p
                 base.append(p)
             preds["average"][r, b] = np.mean(base, axis=0)
+    base = ~data["is_ai"].values
     scores = {}
     for n, P in preds.items():
-        per = [_scores(y, P[r], wb) for r in range(CV_REPEATS)]
+        per = [_scores(y[base], P[r][base], wb[base]) for r in range(CV_REPEATS)]
         scores[n] = {k: float(np.mean([s[k] for s in per])) for k in per[0]}
         scores[n]["rmse_log_sd_across_repeats"] = float(np.std([s["rmse_log"] for s in per]))
+    if (~base).any():
+        per = [_scores(y[~base], preds["average"][r][~base], wb[~base]) for r in range(CV_REPEATS)]
+        scores["average"]["ai_rows"] = {k: float(np.mean([s[k] for s in per])) for k in per[0]}
     return scores, preds["average"]
 
 
@@ -502,9 +517,12 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
     tr, te = data.iloc[tr_idx], data.iloc[te_idx]
     X_tr, y_tr, g_tr = tr[F], tr["log_rent"], tr["listing_key"]
     w_tr = None if fit_w is None else fit_w.iloc[tr_idx]
+    te_all = te
+    te = te[~te["is_ai"].values]          # scores on the original rows only (no-op without AI rows)
     X_te, y_te, wb_te = te[F], te["log_rent"], te["w_building"]
     print(f"training 1: train {len(tr)} units in {g_tr.nunique()} buildings; "
-          f"test {len(te)} units in {te['listing_key'].nunique()} buildings")
+          f"test {len(te)} units in {te['listing_key'].nunique()} buildings"
+          + (f" (+{len(te_all) - len(te)} AI rows held out, not scored)" if len(te_all) > len(te) else ""))
 
     scorer = make_scorer(mean_squared_error, greater_is_better=False).set_score_request(sample_weight=weighted)
     cv = GroupKFold(n_splits=N_FOLDS)
@@ -535,9 +553,10 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
         print(f"  {n:>7}: {s['rmse_log']:.4f} +/- {s['rmse_log_sd_across_repeats']:.4f}  (${s['rmse_usd']:,.0f})  "
               f"by building {s['rmse_log_by_building']:.4f} (${s['rmse_usd_by_building']:,.0f})")
 
-    # out-of-building residuals of the average: exp() bias correction and the 80% range, by bedroom count
-    resid = (data["log_rent"].values[None, :] - oof).ravel()
-    beds = np.tile(data["beds"].round().astype(int).values, CV_REPEATS)
+    # out-of-building residuals of the average (original rows): exp() bias correction and the 80% range
+    base = ~data["is_ai"].values
+    resid = (data["log_rent"].values[None, base] - oof[:, base]).ravel()
+    beds = np.tile(data["beds"].round().astype(int).values[base], CV_REPEATS)
     smearing = float(np.mean(np.exp(resid)))
 
     def q(r):
@@ -562,6 +581,10 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
             n_rows_read=int(len(raw)), n_used=int(len(d)), n_buildings=int(d["listing_key"].nunique()),
             cleaning_steps=steps,
             weights=weights,
+            data_sources={str(k): int(v) for k, v in
+                          (d["data_source"].value_counts().items() if "data_source" in d else [("realtyapi_download", len(d))])},
+            ai_rows_weight=(float(pd.to_numeric(d.loc[d["data_source"] == AI_SOURCE, "source_weight"]).mean())
+                            if "data_source" in d and (d["data_source"] == AI_SOURCE).any() else None),
             target="log(advertised asking monthly rent, USD)",
             test=dict(split=f"{int(TEST_FRACTION * 100)}% of buildings held out (seed {SPLIT_SEED}); "
                             f"tuned by {N_FOLDS}-fold building-grouped CV on the rest",

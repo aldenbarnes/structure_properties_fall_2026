@@ -21,7 +21,9 @@ import pandas as pd
 import streamlit as st
 
 import create_model_test as rent_model   # the SF model (Code/models/rent_blend.joblib)
+import ai_audit_log as al
 import feature_adjustments as fa
+import live_check as lc
 import realty_lookup as rl
 import sf_address
 
@@ -84,16 +86,17 @@ FORM_DEFAULTS = {"f_beds": None, "f_baths": None, "f_sqft": None, "f_floor": Non
 ss = st.session_state
 for k, v in {"zillow": None, "lookup_steps": [], "results": [], "units": [], "details": None, "summary": None, "amen_names": [], "building": None,
              "typed_unit": None, "typed_zip": None, "msg": None, "last_pick": None, "unit_idx": -1,
-             "load_id": 0, "result": None, "floor_note": None, **FORM_DEFAULTS}.items():
+             "load_id": 0, "result": None, "floor_note": None, "live_check": None, "live_decision": None,
+             **FORM_DEFAULTS}.items():
     ss.setdefault(k, v)
 
 
-def env_key():
+def env_key(name="REALTYAPI_KEY"):
     import os
-    key = os.environ.get("REALTYAPI_KEY", "").strip()
+    key = os.environ.get(name, "").strip()
     if not key:
         try:
-            key = str(st.secrets.get("REALTYAPI_KEY", "")).strip()
+            key = str(st.secrets.get(name, "")).strip()
         except Exception:   # no secrets file
             key = ""
     return key
@@ -458,6 +461,18 @@ with st.sidebar:
                                                                MODEL_INFO["n_buildings"]))
     st.caption("Features the SF model doesn't measure (condition, views, pets, ...) are priced from published "
                "studies. See the breakdown under the estimate.")
+    st.divider()
+    st.header("Live check")
+    llm_key = env_key("ANTHROPIC_API_KEY")
+    if llm_key:
+        st.caption("Anthropic key loaded from settings.")
+    else:
+        llm_key = st.text_input("Anthropic API key", type="password",
+                                help="Not saved. Needed for the live check of an estimate.").strip()
+    al.configure_github(env_key("GITHUB_TOKEN") or None)
+    st.caption("The live check has an AI read current comparable listings and check the estimate. "
+               "Up to {} RealtyAPI requests and 2 AI calls per check. ".format(1 + lc.MAX_BUILDINGS)
+               + al.persistence_note())
 
 # ---------- address ----------
 st.title("SF rent lookup")
@@ -663,6 +678,7 @@ def run_estimate():
 
 if estimate_clicked:
     ss.result = run_estimate()
+    ss.live_check = ss.live_decision = None     # a check belongs to the estimate it checked
 
 # ---------- estimate ----------
 st.subheader("Estimate")
@@ -727,8 +743,131 @@ else:
                        "training buildings advertise adds less, and lacking it subtracts a little. Most sources are "
                        "listing comparisons or renter surveys, checked against search-engine extracts rather than "
                        "full documents; treat low-confidence adjustments as rough.")
+    market = fa.market_conditions(ss.f_zip)
+    if market:
+        bits, eff = [], est
+        if market.get("effective_discount_pct") is not None:
+            eff = est * (1 - market["effective_discount_pct"] / 100)
+            bits.append("{:.0%} of {} comparable buildings in {} offer free rent (about {:g} weeks when they do), "
+                        "a {:.1f}% average discount".format(market["share_with_concession"], market["buildings"],
+                                                          market["area"], market["avg_free_weeks_when_offered"],
+                                                          market["effective_discount_pct"]))
+        if market.get("median_required_fees"):
+            bits.append("required fees of about \\${:,.0f}/mo on top of rent".format(market["median_required_fees"]))
+        st.info("**Expected net effective rent about \\${:,.0f}/mo.** The estimate is an asking rent; AI live-check "
+                "findings (updated {}) show {}.".format(eff, str(market["generated_at"])[:10], "; ".join(bits)))
     if model["warnings"]:
         st.warning("\n".join("- " + w for w in model["warnings"]))
+
+# ---------- live check ----------
+VERDICT_LABEL = {"confirmed": ("success", "Confirmed by live listings"), "review": ("warning", "Review"),
+                 "disagree": ("error", "Live listings disagree"),
+                 "insufficient_evidence": ("info", "Not enough comparable listings"),
+                 "audit_error": ("error", "The live check failed")}
+def md(text):
+    """Escape $ so dollar amounts in AI-written text don't render as math."""
+    return str(text or "").replace("$", "\\$")
+
+
+DECISIONS = {"accept_model": "Keep the estimate", "use_live": "Use the live median", "sent_to_analyst": "Send to an analyst"}
+
+
+def run_live_check(client, llm_key):
+    import anthropic
+    lat, lon = ss.f_lat, ss.f_lon
+    subject = {"beds": ss.f_beds, "baths": ss.f_baths, "sqft": ss.f_sqft, "zip_code": (ss.f_zip or "").strip(),
+               "latitude": lat, "longitude": lon,
+               "listing_key": rl._find_first(ss.details, ["listingKey"]) if ss.details is not None else None,
+               "address": (ss.summary or {}).get("address") or (ss.building.address if ss.building else None),
+               "amenities": list(ss.amen_names or []), "condition": ss.s_condition}
+    model, adj = ss.result["model"], ss.result["adj"]
+    estimate = {"model": model["estimate"], "final": round(adj["estimate"]),
+                "low": round(model["low"] * adj["factor"]), "high": round(model["high"] * adj["factor"])}
+    try:
+        check = lc.run_check(client, lc.ClaudeLLM(llm_key), subject, estimate, MODEL_INFO["trained"])
+    except (rl.APIError, anthropic.APIError) as exc:
+        ss.msg = ("error", "Live check stopped: {}".format(exc))
+        return
+    check["log_problems"] = al.record_check(check)
+    ss.live_check, ss.live_decision = check, None
+
+
+def decide(decision):
+    ss.live_decision = decision
+    problem = al.record_decision(ss.live_check["check_id"], decision)
+    if problem:
+        ss.msg = ("warning", problem)
+
+
+if ss.result is not None:
+    st.subheader("Live check")
+    missing = [n for n, ok in [("a RealtyAPI key", client is not None), ("an Anthropic API key", bool(llm_key)),
+                               ("bedrooms", ss.f_beds is not None), ("a zip code", bool((ss.f_zip or "").strip()))]
+               if not ok]
+    if missing:
+        st.caption("To check this estimate against live listings, add " + ", ".join(missing) + ".")
+    elif ss.live_check is None:
+        st.caption("An AI reads the nearest comparable apartments.com listings (specials, required fees, lease "
+                   "terms, condition), judges how comparable each unit is, and explains any gap. The rent "
+                   "figures and the verdict are computed from the listings, not by the AI.")
+        st.button("Check against live listings (up to {} requests)".format(1 + lc.MAX_BUILDINGS),
+                  on_click=run_live_check, args=(client, llm_key))
+    chk = ss.live_check
+    if chk is not None:
+        kind, label = VERDICT_LABEL[chk["verdict"]]
+        getattr(st, kind)("**{}.** {}".format(label, md(chk["explanation"])))
+        dollars = lambda v: "\\${:,.0f}".format(v) if v else "n/a"
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("This estimate", dollars(chk["estimate"]["final"]))
+        c2.metric("Live effective median", dollars(chk["live_effective_median"]),
+                  help="Median net effective rent of the comps: asking rent with free rent spread over the lease "
+                       "(required fees are listed per comp, not added). Each building counts once; High comps "
+                       "count double Medium ones.")
+        c3.metric("Gap", "{:+.1f}%".format(chk["gap_pct"]) if chk["gap_pct"] is not None else "n/a",
+                  help="Estimate vs the live effective median. Confirmed within ±{:g}%, Review within ±{:g}%."
+                  .format(lc.CONFIRM_PCT, lc.REVIEW_PCT))
+        c4.metric("Comps used", chk["units_used"], help="Comparable units used, in {} building(s)."
+                  .format(chk["buildings_used"]))
+        c4.caption("in {} building(s)".format(chk["buildings_used"]))
+        if chk.get("live_asking_median"):
+            st.caption("Live asking median {} (gap {:+.1f}%): the difference between this and the effective median "
+                       "is free rent.".format(dollars(chk["live_asking_median"]), chk["asking_gap_pct"]))
+        for d in chk["drivers"]:
+            what = d["factor"].replace("_", " ") + (" ({})".format(d["feature"]) if d.get("feature") else "")
+            st.markdown("- **{}**, {} by the estimate: {} _(comps: {})_".format(
+                what.capitalize(), d["assessment"], md(d["explanation"]), ", ".join(d["cited_unit_ids"])))
+        for f in chk["flags"]:
+            st.caption("Note: " + md(f))
+        if chk["comps"]:
+            st.dataframe(pd.DataFrame([{
+                "Comp": c["unit_id"], "Building": c.get("address") or c.get("name"), "Sq ft": c.get("sqft"),
+                "Asking": c["asking_rent"], "Free rent (wks)": c.get("concession_weeks"),
+                "Special": c.get("concession_text") or "", "Req. fees / mo": c.get("mandatory_monthly_fees"),
+                "Effective": c.get("effective_rent"), "Comparability": c.get("comparability") or "",
+                "Why": c.get("comparability_reason") or c.get("exclusion_reason") or "",
+                "Used": c["used"]} for c in chk["comps"]]), hide_index=True, width="stretch",
+                column_config={"Asking": st.column_config.NumberColumn(format="dollar"),
+                               "Effective": st.column_config.NumberColumn(format="dollar"),
+                               "Req. fees / mo": st.column_config.NumberColumn(format="dollar")})
+        if chk["verdict"] not in ("audit_error",):
+            if ss.live_decision:
+                st.success("Recorded: {}.".format(DECISIONS[ss.live_decision]))
+            else:
+                b1, b2, b3 = st.columns(3)
+                b1.button(DECISIONS["accept_model"], on_click=decide, args=("accept_model",))
+                b2.button(DECISIONS["use_live"], on_click=decide, args=("use_live",),
+                          disabled=not chk["live_effective_median"])
+                b3.button(DECISIONS["sent_to_analyst"], on_click=decide, args=("sent_to_analyst",))
+        notes = chk["validation_errors"] + chk["notes"] + chk.get("log_problems", [])
+        with st.expander("Check details"):
+            st.caption("Check {} at {}; AI models: {} (listings), {} (explanation). Every comp it read is saved "
+                       "as training data labeled data_source=ai_audit, ai_source_type={}, kept apart from the "
+                       "original training data. {}".format(
+                           chk["check_id"], chk["checked_at"], chk["llm"]["extraction_model"],
+                           chk["llm"]["verdict_model"], al.SOURCE_TYPE.get(chk["verdict"], "none"),
+                           al.persistence_note()))
+            for n in notes:
+                st.caption("- " + md(n))
 
 # ---------- diagnostics ----------
 if client is not None:

@@ -26,11 +26,18 @@ Percent premiums multiply the model estimate; dollar premiums are added after.
 Research caveat: the sources were checked against search-engine extracts, not full documents, and
 most are raw listing comparisons or renter surveys rather than size-controlled studies. Values were
 set below the headline figures, and most are low confidence.
+
+AI live-check recalibration: Code/ai_feedback.py may write Data/ai_audit/learned_adjustments.json
+when the AI live check keeps flagging a feature AND the comps it read measure a different premium.
+Those premiums replace the study value here (a blend of the study value and the measured one), and
+the row lists "AI live-check findings" as an added source. market_conditions() gives the typical
+concessions and required fees by zip the same way. Without that file nothing changes.
 """
 import csv
 from pathlib import Path
 
 TRAINING_PATH = Path(__file__).resolve().parent.parent / "Data" / "realty_training.csv"
+LEARNED_PATH = Path(__file__).resolve().parent.parent / "Data" / "ai_audit" / "learned_adjustments.json"
 
 # ---------- what the user picks ----------
 UNKNOWN = "Unknown"
@@ -253,6 +260,58 @@ EFFECTS = {
 }
 
 
+def load_learned(path=LEARNED_PATH):
+    """Adjustments learned from AI live-check findings (Code/ai_feedback.py), or {} if none."""
+    import json
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+LEARNED = load_learned()
+
+
+def effect(kind, name):
+    """EFFECTS entry, recalibrated by AI live-check findings when there are any for it."""
+    base = EFFECTS.get((kind, name))
+    got = (LEARNED.get(kind) or {}).get(name) if kind in ("feature", "condition") else None
+    if not base or not got:
+        return base
+    src = dict(LEARNED.get("source") or {}, year=str(LEARNED.get("generated_at", ""))[:4] or None)
+    note = ("{} Recalibrated from AI live-check findings: {} checks flagged it as {}weighted and {} comparable "
+            "buildings measured {:+.1f}% (±{:.1f}) against the SF model, vs {:+g}% from the studies.").format(
+        base["note"], got["checks_flagging"], "under" if got["ai_assessment"] == "under" else "over",
+        got["buildings_with"] + got["buildings_without"], got["measured_value"], got["measured_se"], got["study_value"])
+    return dict(base, value=got["value"], low=got["low"], high=got["high"], confidence="medium",
+                note=note, sources=base["sources"] + [src], learned=True)
+
+
+def market_conditions(zip_code):
+    """Typical concessions and required fees near a zip, from AI live-check findings, or None.
+
+    Returns {"area", "buildings", "share_with_concession", "avg_free_weeks_when_offered",
+    "effective_discount_pct", "median_required_fees", "generated_at"}; either part may be missing."""
+    market = LEARNED.get("market") or {}
+    out = {}
+    for factor in ("concessions", "mandatory_fees"):
+        m = market.get(factor)
+        if not m:
+            continue
+        z = str(zip_code or "")[:5]
+        row, area = (m["by_zip"][z], z) if z in (m.get("by_zip") or {}) else (m["citywide"], "San Francisco")
+        if factor == "concessions":
+            out.update(area=area, buildings=row["buildings"], share_with_concession=row["share_with_concession"],
+                       avg_free_weeks_when_offered=row["avg_free_weeks_when_offered"],
+                       effective_discount_pct=row["effective_discount_pct"])
+        else:
+            out.update(fees_area=area, median_required_fees=row["median_required_fees"])
+    if out:
+        out["generated_at"] = LEARNED.get("generated_at")
+    return out or None
+
+
 def _norm(s):
     import re
     return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
@@ -309,7 +368,7 @@ def adjustments(choices):
         picked = choices.get(key)
         if not picked or picked == UNKNOWN or picked == BASELINE[key]:
             continue
-        mine, base = EFFECTS.get((key, picked)), EFFECTS.get((key, BASELINE[key]))
+        mine, base = effect(key, picked), effect(key, BASELINE[key])
         if not mine:
             continue
         if base and base["value"]:
@@ -331,7 +390,7 @@ def adjustments(choices):
     for feat in UNIT_FEATURES + BUILDING_FEATURES:
         if feat in skip:
             continue
-        eff = EFFECTS.get(("feature", feat))
+        eff = effect("feature", feat)
         if not eff or not eff["value"]:
             continue
         p = PREVALENCE.get(feat, 0.0)

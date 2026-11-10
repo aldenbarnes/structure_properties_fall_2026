@@ -36,3 +36,26 @@ python Code/add_crime.py
 ```
 python Code/edit_training_data.py
 ```
+
+### AI live check
+Under every estimate, **Check against live listings** has an AI read the nearest comparable apartments.com listings: their move-in specials, fee tables, lease terms, descriptions and amenities. It rates how comparable each unit is and explains any gap between the estimate and the live market, citing the comps behind each point. Rent figures and the verdict (estimate vs the comps' net effective rent: Confirmed within ±4%, Review within ±8%, Disagrees, or Not enough comparable listings) are computed in code from the listings; anything the AI claims that the listing doesn't show (a special, a fee, a comp ID) is thrown out. One check uses up to 7 RealtyAPI requests and 2 Anthropic API calls (`Code/live_check.py`).
+
+Add `ANTHROPIC_API_KEY` next to `REALTYAPI_KEY` in `.streamlit/secrets.toml` (or the app's Secrets on Streamlit Cloud). On Streamlit Cloud also add `GITHUB_TOKEN` (contents: write), or the logs are lost when the app restarts. The logs are committed to their own `ai-audit-logs` branch so they don't redeploy the app; get them with `git fetch origin ai-audit-logs && git checkout origin/ai-audit-logs -- Data/ai_audit`.
+
+**Logs, kept apart from the training data.** Everything goes to `Data/ai_audit/` (`Code/ai_audit_log.py`, which refuses to write to `Data/training/`, the base CSVs or the crime grid): `critique_log.jsonl` (every check), `disagreement_log.jsonl` (Review and Disagrees only), `decisions.jsonl` (keep the estimate / use the live median / send to an analyst) and `ai_training_rows.csv` (every comp the AI read, in the same columns as the training data plus the AI-read fields and source labels: `data_source=ai_audit`, `ai_source_type` = `ai_disagreement` / `ai_confirmation` / `ai_insufficient_evidence`, the check ID, the AI models and the prompt version).
+
+**Training with the AI rows** (`Code/build_training_view.py`) writes a separate file, `Data/training_views/training_with_ai.csv`: the rows of `realty_training_combined_final.csv` labeled `realtyapi_download`, plus AI rows for units the downloads don't have, at half weight, with crime scores looked up from `Data/crime_grid.csv`. `create_model_test.py` reads the labels: AI rows count for `source_weight`, and every score it reports is on original rows only.
+
+```
+python Code/build_training_view.py
+python Code/create_model_test.py --data Data/training_views/training_with_ai.csv --out Code/models/test_with_ai.joblib
+```
+
+**Learning from recurring findings** (`Code/ai_feedback.py`). When the AI keeps raising the same factor (in 8+ disagreement checks in 90 days, 65%+ of them the same way) and the comps it read measure the effect in code (|t| >= 2), the tool adjusts. Typical concessions by zip show as an expected net effective rent next to the estimate (required fees alongside). Study-based premiums (condition, features the model doesn't price) are recalibrated in `feature_adjustments.py`, citing "AI live-check findings" as a source. Amenities the model prices get more training data instead: `--compare` tests whether the AI rows improve the model on original rows, and `--retrain` switches to the retrained model only if they do (the old one is kept as `rent_blend_previous.joblib`). Adjustments are rebuilt on every run, so one the evidence stops supporting goes away.
+
+```
+python Code/ai_feedback.py              # report + learned adjustments (Data/ai_audit/learned_adjustments.json)
+python Code/ai_feedback.py --compare    # does adding the AI rows help? (about 3 minutes)
+python Code/ai_feedback.py --retrain    # retrain and switch if it does
+python -m pytest Code/tests -q          # tests (no API calls)
+```
