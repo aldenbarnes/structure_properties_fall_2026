@@ -5,3 +5,5 @@ scikit-learn==1.9.1
 joblib>=1.3
 numpy
 pandas
+# AI live check (Code/live_check.py)
+anthropic>=0.40
