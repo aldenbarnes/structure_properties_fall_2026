@@ -764,6 +764,11 @@ VERDICT_LABEL = {"confirmed": ("success", "Confirmed by live listings"), "review
                  "disagree": ("error", "Live listings disagree"),
                  "insufficient_evidence": ("info", "Not enough comparable listings"),
                  "audit_error": ("error", "The live check failed")}
+def md(text):
+    """Escape $ so dollar amounts in AI-written text don't render as math."""
+    return str(text or "").replace("$", "\\$")
+
+
 DECISIONS = {"accept_model": "Keep the estimate", "use_live": "Use the live median", "sent_to_analyst": "Send to an analyst"}
 
 
@@ -810,7 +815,7 @@ if ss.result is not None:
     chk = ss.live_check
     if chk is not None:
         kind, label = VERDICT_LABEL[chk["verdict"]]
-        getattr(st, kind)("**{}.** {}".format(label, chk["explanation"]))
+        getattr(st, kind)("**{}.** {}".format(label, md(chk["explanation"])))
         dollars = lambda v: "\\${:,.0f}".format(v) if v else "n/a"
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("This estimate", dollars(chk["estimate"]["final"]))
@@ -821,16 +826,18 @@ if ss.result is not None:
         c3.metric("Gap", "{:+.1f}%".format(chk["gap_pct"]) if chk["gap_pct"] is not None else "n/a",
                   help="Estimate vs the live effective median. Confirmed within ±{:g}%, Review within ±{:g}%."
                   .format(lc.CONFIRM_PCT, lc.REVIEW_PCT))
-        c4.metric("Comps used", "{} in {} bldgs".format(chk["units_used"], chk["buildings_used"]))
+        c4.metric("Comps used", chk["units_used"], help="Comparable units used, in {} building(s)."
+                  .format(chk["buildings_used"]))
+        c4.caption("in {} building(s)".format(chk["buildings_used"]))
         if chk.get("live_asking_median"):
             st.caption("Live asking median {} (gap {:+.1f}%): the difference between this and the effective median "
                        "is free rent.".format(dollars(chk["live_asking_median"]), chk["asking_gap_pct"]))
         for d in chk["drivers"]:
             what = d["factor"].replace("_", " ") + (" ({})".format(d["feature"]) if d.get("feature") else "")
             st.markdown("- **{}**, {} by the estimate: {} _(comps: {})_".format(
-                what.capitalize(), d["assessment"], d["explanation"], ", ".join(d["cited_unit_ids"])))
+                what.capitalize(), d["assessment"], md(d["explanation"]), ", ".join(d["cited_unit_ids"])))
         for f in chk["flags"]:
-            st.caption("Note: " + f)
+            st.caption("Note: " + md(f))
         if chk["comps"]:
             st.dataframe(pd.DataFrame([{
                 "Comp": c["unit_id"], "Building": c.get("address") or c.get("name"), "Sq ft": c.get("sqft"),
@@ -860,7 +867,7 @@ if ss.result is not None:
                            chk["llm"]["verdict_model"], al.SOURCE_TYPE.get(chk["verdict"], "none"),
                            al.persistence_note()))
             for n in notes:
-                st.caption("- " + n)
+                st.caption("- " + md(n))
 
 # ---------- diagnostics ----------
 if client is not None:
