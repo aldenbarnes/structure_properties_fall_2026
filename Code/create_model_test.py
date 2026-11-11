@@ -57,14 +57,17 @@ asymmetric squared loss on log rent (about a percent error): r = log(actual) - l
 UNDER_WEIGHT * r^2 when r > 0 (an underestimate) and r^2 when r < 0. The four models are still
 tuned and fit for the mean (plain squared loss). Two corrections are applied afterwards, both from the
 out-of-building residuals of the average (step 5), kept apart so each can be judged on its own:
-  1. bias correction: per bedroom count, the mean residual, so each bedroom count is unbiased
-     (the blend can run high or low for a bedroom count; this has nothing to do with the loss);
-  2. asymmetry shift: one overall shift that minimises the asymmetric loss of the bias-corrected
-     residuals (their tau-expectile, tau = w / (1 + w)).
+  1. bias correction (off by default, --bias-correction turns it on): per bedroom count, the mean
+     residual, so each bedroom count is unbiased. It is always printed as a diagnostic. It is off
+     because it barely helped in CV (Nov 2026) and the 3BR figure rests on ~55 units;
+  2. asymmetry shift: one overall shift that minimises the asymmetric loss of the (bias-corrected,
+     if on) residuals (their tau-expectile, tau = w / (1 + w)).
 predict_rent() multiplies the estimate by exp(bias correction + shift). The low/high range is not
 shifted: it describes where actual rents fall, which the corrections do not change.
---under-weight 1 gives asymmetry shift 0 (bias correction only).
-Every score is also reported as root asymmetric loss ("asym"); RMSE gets worse by design when the
+--under-weight 1 gives asymmetry shift ~0.
+The headline score is the error bands: the percent of held-out units whose estimate is $1,000+,
+$500-1,000, $250-500, $100-250 or $0-100 below the actual rent, and the same above (ERROR_BAND_EDGES),
+for the test set and for the repeated CV. Every score is also reported as root asymmetric loss ("asym"); RMSE gets worse by design when the
 shift is on, so compare versions on asym. The corrections are chosen on the same out-of-fold
 residuals they are scored on (a few numbers in all), so the corrected rows are slightly optimistic.
 """
@@ -125,6 +128,7 @@ SPLIT_SEED = 2026
 N_FOLDS = 5
 CV_REPEATS = 3
 MIN_BEDS_FOR_OWN_RANGE = 40   # bedroom counts with fewer out-of-fold units use the overall range and shift
+ERROR_BAND_EDGES = [100, 250, 500, 1000]   # $ edges of the error bands (estimate minus actual rent)
 UNDER_WEIGHT = 1.25       # asymmetric loss: an underestimate costs this many times an overestimate of the same size
 
 # Tuning grids (from test_models.ipynb, widened where the best value sat at an edge)
@@ -496,6 +500,39 @@ def _scores(y, pred, w, under_weight=UNDER_WEIGHT):
                 asym_log_by_building=asym_loss(y, pred, under_weight, w))
 
 
+def error_band_labels():
+    e = ERROR_BAND_EDGES
+    below = [f"${e[-1]:,}+ below"] + [f"${lo:,}-{hi:,} below" for lo, hi in zip(reversed([0] + e[:-1]), reversed(e))]
+    above = [f"${lo:,}-{hi:,} above" for lo, hi in zip([0] + e[:-1], e)] + [f"${e[-1]:,}+ above"]
+    return below + above
+
+
+def error_bands(actual_usd, est_usd):
+    """Percent of units in each dollar error band, estimate minus actual: "below" = the estimate is under
+    the actual rent (an underestimate). A miss of exactly $X counts in the band that starts at $X
+    ($1,000 below is "$1,000+ below"; $0 is "$0-100 above")."""
+    d = np.asarray(est_usd, dtype=float) - np.asarray(actual_usd, dtype=float)
+    size = np.searchsorted(ERROR_BAND_EDGES, np.abs(d), side="right")   # 0 = under $100 ... 4 = $1,000+
+    n = len(ERROR_BAND_EDGES)
+    band = np.where(d < 0, n - size, n + 1 + size)                       # index into error_band_labels()
+    counts = np.bincount(band, minlength=2 * n + 2)
+    return dict(zip(error_band_labels(), (100.0 * counts / len(d)).round(1).tolist()))
+
+
+def _print_error_bands(columns):
+    """columns: {heading: error_bands() result}. One row per band, then within $250 / $500 and under / over."""
+    heads = list(columns)
+    width = max(16, *(len(h) + 2 for h in heads))
+    print("  " + "error (estimate - actual)".ljust(22) + "".join(h.rjust(width) for h in heads))
+    for band in error_band_labels():
+        print("  " + band.ljust(22) + "".join(f"{columns[h][band]:>{width - 1}.1f}%" for h in heads))
+    for label, keys in (("within $250", ("$100-250 below", "$0-100 below", "$0-100 above", "$100-250 above")),
+                        ("within $500", ("$250-500 below", "$100-250 below", "$0-100 below", "$0-100 above",
+                                         "$100-250 above", "$250-500 above")),
+                        ("underestimates", tuple(b for b in error_band_labels() if b.endswith("below")))):
+        print("  " + label.ljust(22) + "".join(f"{sum(columns[h][k] for k in keys):>{width - 1}.1f}%" for h in heads))
+
+
 def _group_folds(groups, k, seed):
     """k folds that hold out whole buildings, shuffled by seed (for repeated CV)."""
     uniq = np.array(sorted(groups.unique()))
@@ -532,7 +569,8 @@ def repeated_cv(tuned, data, F, weighted, fit_w, under_weight=UNDER_WEIGHT):
     return scores, preds["average"]
 
 
-def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME_GRID, under_weight=UNDER_WEIGHT):
+def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME_GRID, under_weight=UNDER_WEIGHT,
+          bias_correction=False):
     t0 = datetime.datetime.now()
     weighted = weights == "building"
     raw = pd.read_csv(data_path)
@@ -583,6 +621,7 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
         print(f"  {name:>5}: CV {r['cv_rmse_log']:.4f}  test {r['rmse_log']:.4f} (${r['rmse_usd']:,.0f})  "
               f"by building {r['rmse_log_by_building']:.4f}  asym {r['asym_log']:.4f}  {r['best_params']}")
     pred = AverageRegressor(tuned).fit(X_tr, y_tr, sample_weight=w_tr).predict(X_te)
+    test_pred_avg = pred
     test_results["average"] = _scores(y_te, pred, wb_te, under_weight)
     r = test_results["average"]
     print(f"  average of all 4: test {r['rmse_log']:.4f} (${r['rmse_usd']:,.0f})  "
@@ -610,11 +649,13 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
 
     # two corrections from the out-of-building residuals, in log rent on top of the average's prediction
     # (the smearing factor is applied on top of both):
-    #   1. bias correction per bedroom count: the mean residual, so each bedroom count is unbiased
-    #   2. asymmetry shift: one overall shift that minimises the asymmetric loss of the bias-corrected residuals
+    #   1. bias correction per bedroom count: the mean residual (printed always, applied only if bias_correction)
+    #   2. asymmetry shift: one overall shift that minimises the asymmetric loss of the residuals left after 1
     overall_bias = float(np.mean(resid))
     bias_beds = {str(b): float(np.mean(resid[beds == b])) for b in own_beds}
     bias_per_row = np.array([bias_beds.get(str(b), overall_bias) for b in beds])
+    if not bias_correction:
+        bias_per_row = np.zeros_like(resid)
     asym_shift = expectile(resid - bias_per_row, under_weight)
     y_base, wb = data["log_rent"].values[base], data["w_building"].values[base]
 
@@ -622,18 +663,37 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
         per = [_scores(y_base, oof[r, base] + shift.reshape(CV_REPEATS, -1)[r], wb, under_weight)
                for r in range(CV_REPEATS)]
         return {k: float(np.mean([p[k] for p in per])) for k in per[0]}
-    cv_results["average_bias_corrected"] = shifted_scores(bias_per_row)
-    cv_results["average_bias_corrected_shifted"] = shifted_scores(bias_per_row + asym_shift)
+    rows = []
+    if bias_correction:
+        cv_results["average_bias_corrected"] = shifted_scores(bias_per_row)
+        rows.append(("+ bias corr", "average_bias_corrected"))
+    cv_results["average_corrected"] = shifted_scores(bias_per_row + asym_shift)
+    rows.append(("+ bias + asym" if bias_correction else "+ asym", "average_corrected"))
     n_beds = {b: int((beds == b).sum() // CV_REPEATS) for b in own_beds}
-    print("  bias correction by bedrooms: " + ", ".join(
+    print(f"  bias by bedrooms ({'applied' if bias_correction else 'diagnostic only, not applied'}): " + ", ".join(
         f"{b}BR {math.expm1(bias_beds[str(b)]):+.1%} ({n_beds[b]} units)" for b in own_beds)
           + f"; other {math.expm1(overall_bias):+.1%}")
     print(f"  asymmetry shift (under-weight {under_weight:g}): {math.expm1(asym_shift):+.1%} for every unit")
-    for label, key in (("+ bias corr", "average_bias_corrected"), ("+ bias + asym", "average_bias_corrected_shifted")):
+    for label, key in rows:
         s = cv_results[key]
         print(f"  {label:>13}: {s['rmse_log']:.4f}  (${s['rmse_usd']:,.0f})  by building "
               f"{s['rmse_log_by_building']:.4f}  asym {s['asym_log']:.4f} (by building "
               f"{s['asym_log_by_building']:.4f})  [corrections chosen on these residuals]")
+
+    # dollar error bands of the estimate predict_rent() gives (smearing + corrections), on units whose
+    # building was held out: the 20% test set, and every unit in the repeated CV (all repeats pooled)
+    def corr(beds_arr):
+        b = beds_arr.round().astype(int)
+        return asym_shift + (np.array([bias_beds.get(str(x), overall_bias) for x in b]) if bias_correction else 0.0)
+    bands_test = error_bands(np.exp(y_te.values), np.exp(test_pred_avg + corr(te["beds"].values)) * smearing)
+    act_cv = np.tile(np.exp(y_base), CV_REPEATS)
+    bands_cv_mean = error_bands(act_cv, np.exp(oof[:, base].ravel()) * smearing)
+    bands_cv = error_bands(act_cv, np.exp(oof[:, base].ravel() + bias_per_row + asym_shift) * smearing)
+    test_results["average"]["error_bands"] = bands_test
+    cv_results["average"]["error_bands"] = bands_cv_mean
+    cv_results["average_corrected"]["error_bands"] = bands_cv
+    print(f"\nerror bands, % of units (buildings the model had not seen; 'below' = estimate under the actual rent):")
+    _print_error_bands({f"test ({len(te)})": bands_test, "CV, no shift": bands_cv_mean, "CV, final": bands_cv})
 
     # ---- training 2: tuned settings, refit on every building ----
     print("\ntraining 2: refitting all 4 models on all buildings...")
@@ -646,8 +706,9 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
         log_residual_quantiles_out_of_sample=resid_q,
         log_residual_quantiles_by_beds=resid_q_beds,
         under_weight=float(under_weight),
-        bias_correction=overall_bias,
-        bias_correction_by_beds=bias_beds,
+        bias_correction=overall_bias if bias_correction else 0.0,
+        bias_correction_by_beds=bias_beds if bias_correction else {},
+        bias_by_beds_diagnostic=bias_beds,
         asym_shift=asym_shift,
         info=dict(
             trained=datetime.date.today().isoformat(),
@@ -666,9 +727,9 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
             repeated_cv=dict(split=f"{CV_REPEATS} x {N_FOLDS}-fold building-grouped CV on all buildings "
                                    f"with the settings tuned in the test run", results=cv_results),
             blend="equal-weight average of log rent from ridge, svm, knn and gbm",
-            loss=f"asymmetric squared loss on log rent, underestimates x{under_weight:g}; applied as a per-bedroom "
-                 f"bias correction (mean out-of-building residual) plus one overall shift (tau-expectile of the "
-                 f"bias-corrected residuals)",
+            loss=f"asymmetric squared loss on log rent, underestimates x{under_weight:g}; applied as one overall "
+                 f"shift (tau-expectile of out-of-building residuals)"
+                 + (", after a per-bedroom bias correction (mean residual)" if bias_correction else ""),
             sklearn_version=sklearn.__version__,
             numpy_version=np.__version__,
             train_seconds=round((datetime.datetime.now() - t0).total_seconds()),
@@ -698,9 +759,17 @@ def model_info(model_path=DEFAULT_OUT):
     note, and the amenities it prices (with the share of training buildings that have each)."""
     b = load_model(model_path)
     info, spec = b["info"], b["spec"]
-    cv = info["repeated_cv"]["results"]["average"]
-    reliability = ("average of ridge, SVM, KNN and gradient boosting; on buildings it had not seen, a typical "
-                   "error of about {:.0%} (RMSE ${:,.0f})".format(math.exp(cv["rmse_log"]) - 1, cv["rmse_usd"]))
+    res = info["repeated_cv"]["results"]
+    cv = res["average"]
+    bands = res.get("average_corrected", {}).get("error_bands")
+    if bands:   # share of estimates within $250 / $500 of the actual rent
+        w250 = sum(v for k, v in bands.items() if k in ("$100-250 below", "$0-100 below", "$0-100 above", "$100-250 above"))
+        w500 = w250 + bands["$250-500 below"] + bands["$250-500 above"]
+        reliability = ("average of ridge, SVM, KNN and gradient boosting; on buildings it had not seen, {:.0f}% of "
+                       "estimates were within $250 of the actual rent and {:.0f}% within $500".format(w250, w500))
+    else:
+        reliability = ("average of ridge, SVM, KNN and gradient boosting; on buildings it had not seen, a typical "
+                       "error of about {:.0%} (RMSE ${:,.0f})".format(math.exp(cv["rmse_log"]) - 1, cv["rmse_usd"]))
     if b.get("under_weight", 1.0) != 1.0:
         reliability += ("; estimates lean high by about {:+.1%} because underestimates count {:g}x as much as "
                         "overestimates".format(math.expm1(b["asym_shift"]), b["under_weight"]))
@@ -808,12 +877,14 @@ def main():
     ap.add_argument("--under-weight", type=float, default=UNDER_WEIGHT,
                     help="asymmetric loss: cost of an underestimate relative to an overestimate "
                          "(default %(default)s; 1 = plain mean estimate)")
+    ap.add_argument("--bias-correction", action="store_true",
+                    help="also correct each bedroom count by its mean out-of-building residual (off by default)")
     ap.add_argument("--predict", action="store_true", help="skip training; load the saved model and run a sample")
     a = ap.parse_args()
     if not a.predict:
         if a.under_weight <= 0:
             sys.exit("--under-weight must be positive")
-        train(a.data, a.out, a.weights, a.crime_grid, a.under_weight)
+        train(a.data, a.out, a.weights, a.crime_grid, a.under_weight, a.bias_correction)
     if not os.path.exists(a.out):
         sys.exit(f"no model at {a.out}")
     sample = dict(bedrooms=1, bathrooms=1, sqft=700, zip_code="94107",
