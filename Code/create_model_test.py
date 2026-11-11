@@ -13,6 +13,7 @@ Usage (from the repo root):
     python Code/edit_training_data.py                      # first: adds the crime columns (needs geopandas)
     python Code/create_model_test.py                       # trains on Data/realty_training_combined_final.csv
     python Code/create_model_test.py --weights unit        # every unit counts once instead of every building
+    python Code/create_model_test.py --under-weight 1.5    # underestimates cost 1.5x overestimates (default 1.25)
     python Code/create_model_test.py --data other.csv --out Code/models/other.joblib
     python Code/create_model_test.py --predict             # load the saved model and run a sample prediction
 
@@ -50,6 +51,18 @@ AI live-check rows (optional): a file from build_training_view.py has a data_sou
 source_weight, so AI rows count for less, and every reported score (test set and repeated CV) is
 computed on the original rows only, so they stay comparable with a model trained without AI rows.
 Scores on the AI rows are reported separately. Without those columns nothing changes.
+
+Asymmetric loss: underestimating rent is worse than overestimating it, so the estimate is judged by
+asymmetric squared loss on log rent (about a percent error): r = log(actual) - log(estimate), loss
+UNDER_WEIGHT * r^2 when r > 0 (an underestimate) and r^2 when r < 0. The four models are still
+tuned and fit for the mean (plain squared loss). The asymmetry is applied afterwards as a shift: the
+out-of-building residuals of the average (step 5) give, per bedroom count, the shift that minimises
+the asymmetric loss (the tau-expectile of the residuals, tau = w / (1 + w)), and predict_rent()
+multiplies the estimate by exp(shift). The low/high range is not shifted: it describes where actual
+rents fall, which the shift does not change. --under-weight 1 gives the plain mean model (shift ~0).
+Every score is also reported as root asymmetric loss ("asym"); RMSE gets worse by design when the
+shift is on, so compare versions on asym. The shift is chosen on the same out-of-fold residuals it is
+scored on (one number per bedroom count), so "average + shift" is slightly optimistic.
 """
 import argparse
 import datetime
@@ -107,7 +120,8 @@ TEST_FRACTION = 0.20
 SPLIT_SEED = 2026
 N_FOLDS = 5
 CV_REPEATS = 3
-MIN_BEDS_FOR_OWN_RANGE = 40   # bedroom counts with fewer out-of-fold units use the overall range
+MIN_BEDS_FOR_OWN_RANGE = 40   # bedroom counts with fewer out-of-fold units use the overall range and shift
+UNDER_WEIGHT = 1.25       # asymmetric loss: an underestimate costs this many times an overestimate of the same size
 
 # Tuning grids (from test_models.ipynb, widened where the best value sat at an edge)
 GRIDS = {
@@ -449,10 +463,33 @@ def _rmse(a, b, w=None):
     return float(np.sqrt(mean_squared_error(a, b, sample_weight=w)))
 
 
-def _scores(y, pred, w):
+def asym_loss(y, pred, under_weight, w=None):
+    """Root of the mean asymmetric squared loss on log rent: residuals y - pred > 0 (underestimates)
+    count under_weight times as much as overestimates. On the same scale as rmse_log."""
+    r = np.asarray(y, dtype=float) - np.asarray(pred, dtype=float)
+    return float(np.sqrt(np.average(np.where(r > 0, under_weight, 1.0) * r ** 2, weights=w)))
+
+
+def expectile(r, under_weight, iters=200):
+    """The shift s that minimises the asymmetric squared loss of residuals r - s (the tau-expectile of r,
+    tau = under_weight / (1 + under_weight)). under_weight = 1 gives the mean."""
+    r = np.asarray(r, dtype=float)
+    s = float(np.mean(r))
+    for _ in range(iters):
+        wt = np.where(r > s, under_weight, 1.0)
+        s_new = float(np.sum(wt * r) / np.sum(wt))
+        if abs(s_new - s) < 1e-12:
+            break
+        s = s_new
+    return s
+
+
+def _scores(y, pred, w, under_weight=UNDER_WEIGHT):
     return dict(rmse_log=_rmse(y, pred), rmse_log_by_building=_rmse(y, pred, w),
                 rmse_usd=_rmse(np.exp(y), np.exp(pred)),
-                rmse_usd_by_building=_rmse(np.exp(y), np.exp(pred), w))
+                rmse_usd_by_building=_rmse(np.exp(y), np.exp(pred), w),
+                asym_log=asym_loss(y, pred, under_weight),
+                asym_log_by_building=asym_loss(y, pred, under_weight, w))
 
 
 def _group_folds(groups, k, seed):
@@ -463,7 +500,7 @@ def _group_folds(groups, k, seed):
     return [(np.where(f != i)[0], np.where(f == i)[0]) for i in range(k)]
 
 
-def repeated_cv(tuned, data, F, weighted, fit_w):
+def repeated_cv(tuned, data, F, weighted, fit_w, under_weight=UNDER_WEIGHT):
     """CV_REPEATS x N_FOLDS building-grouped CV with the tuned settings. Returns
     (scores per model, out-of-fold predictions of the average per repeat). Scores use the original
     rows only; AI live-check rows are trained on but scored separately (scores["average"]["ai_rows"])."""
@@ -482,16 +519,16 @@ def repeated_cv(tuned, data, F, weighted, fit_w):
     base = ~data["is_ai"].values
     scores = {}
     for n, P in preds.items():
-        per = [_scores(y[base], P[r][base], wb[base]) for r in range(CV_REPEATS)]
+        per = [_scores(y[base], P[r][base], wb[base], under_weight) for r in range(CV_REPEATS)]
         scores[n] = {k: float(np.mean([s[k] for s in per])) for k in per[0]}
         scores[n]["rmse_log_sd_across_repeats"] = float(np.std([s["rmse_log"] for s in per]))
     if (~base).any():
-        per = [_scores(y[~base], preds["average"][r][~base], wb[~base]) for r in range(CV_REPEATS)]
+        per = [_scores(y[~base], preds["average"][r][~base], wb[~base], under_weight) for r in range(CV_REPEATS)]
         scores["average"]["ai_rows"] = {k: float(np.mean([s[k] for s in per])) for k in per[0]}
     return scores, preds["average"]
 
 
-def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME_GRID):
+def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME_GRID, under_weight=UNDER_WEIGHT):
     t0 = datetime.datetime.now()
     weighted = weights == "building"
     raw = pd.read_csv(data_path)
@@ -534,24 +571,26 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
         search.fit(X_tr, y_tr, groups=g_tr, **kw)
         pred = search.predict(X_te)
         tuned[name] = clone(search.best_estimator_)   # settings only; the fitted copy is not kept
-        test_results[name] = dict(cv_rmse_log=float(np.sqrt(-search.best_score_)), **_scores(y_te, pred, wb_te),
+        test_results[name] = dict(cv_rmse_log=float(np.sqrt(-search.best_score_)),
+                                  **_scores(y_te, pred, wb_te, under_weight),
                                   best_params={k.split("__")[-1]: (v.item() if hasattr(v, "item") else v)
                                                for k, v in search.best_params_.items()})
         r = test_results[name]
         print(f"  {name:>5}: CV {r['cv_rmse_log']:.4f}  test {r['rmse_log']:.4f} (${r['rmse_usd']:,.0f})  "
-              f"by building {r['rmse_log_by_building']:.4f}  {r['best_params']}")
+              f"by building {r['rmse_log_by_building']:.4f}  asym {r['asym_log']:.4f}  {r['best_params']}")
     pred = AverageRegressor(tuned).fit(X_tr, y_tr, sample_weight=w_tr).predict(X_te)
-    test_results["average"] = _scores(y_te, pred, wb_te)
+    test_results["average"] = _scores(y_te, pred, wb_te, under_weight)
     r = test_results["average"]
     print(f"  average of all 4: test {r['rmse_log']:.4f} (${r['rmse_usd']:,.0f})  "
-          f"by building {r['rmse_log_by_building']:.4f}")
+          f"by building {r['rmse_log_by_building']:.4f}  asym {r['asym_log']:.4f}")
 
     # ---- repeated CV over all buildings with the tuned settings ----
     print(f"\nrepeated CV ({CV_REPEATS} x {N_FOLDS}-fold by building, all {len(data)} units, tuned settings):")
-    cv_results, oof = repeated_cv(tuned, data, F, weighted, fit_w)
+    cv_results, oof = repeated_cv(tuned, data, F, weighted, fit_w, under_weight)
     for n, s in cv_results.items():
         print(f"  {n:>7}: {s['rmse_log']:.4f} +/- {s['rmse_log_sd_across_repeats']:.4f}  (${s['rmse_usd']:,.0f})  "
-              f"by building {s['rmse_log_by_building']:.4f} (${s['rmse_usd_by_building']:,.0f})")
+              f"by building {s['rmse_log_by_building']:.4f} (${s['rmse_usd_by_building']:,.0f})  "
+              f"asym {s['asym_log']:.4f} (by building {s['asym_log_by_building']:.4f})")
 
     # out-of-building residuals of the average (original rows): exp() bias correction and the 80% range
     base = ~data["is_ai"].values
@@ -562,8 +601,23 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
     def q(r):
         return {f"p{p}": float(np.percentile(r, p)) for p in (10, 25, 50, 75, 90)}
     resid_q = q(resid)
-    resid_q_beds = {str(b): q(resid[beds == b]) for b in np.unique(beds)
-                    if (beds == b).sum() / CV_REPEATS >= MIN_BEDS_FOR_OWN_RANGE}
+    own_beds = [b for b in np.unique(beds) if (beds == b).sum() / CV_REPEATS >= MIN_BEDS_FOR_OWN_RANGE]
+    resid_q_beds = {str(b): q(resid[beds == b]) for b in own_beds}
+
+    # asymmetric loss: per bedroom count, the log shift that minimises it on the out-of-building residuals
+    # (shift is measured from the average's log prediction; the smearing factor is applied on top of both)
+    asym_shift = expectile(resid, under_weight)
+    asym_shift_beds = {str(b): expectile(resid[beds == b], under_weight) for b in own_beds}
+    shift_per_row = np.array([asym_shift_beds.get(str(b), asym_shift) for b in beds])
+    y_base, wb = data["log_rent"].values[base], data["w_building"].values[base]
+    shifted = [_scores(y_base, oof[r, base] + shift_per_row.reshape(CV_REPEATS, -1)[r], wb, under_weight)
+               for r in range(CV_REPEATS)]
+    cv_results["average_shifted"] = {k: float(np.mean([s[k] for s in shifted])) for k in shifted[0]}
+    s = cv_results["average_shifted"]
+    print(f"  average + shift (under-weight {under_weight:g}; overall {math.expm1(asym_shift):+.1%}, by bedrooms "
+          + ", ".join(f"{b}BR {math.expm1(v):+.1%}" for b, v in asym_shift_beds.items()) + "):")
+    print(f"           {s['rmse_log']:.4f}  (${s['rmse_usd']:,.0f})  by building {s['rmse_log_by_building']:.4f}  "
+          f"asym {s['asym_log']:.4f} (by building {s['asym_log_by_building']:.4f})  [shift chosen on these residuals]")
 
     # ---- training 2: tuned settings, refit on every building ----
     print("\ntraining 2: refitting all 4 models on all buildings...")
@@ -575,6 +629,9 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
         smearing=smearing,
         log_residual_quantiles_out_of_sample=resid_q,
         log_residual_quantiles_by_beds=resid_q_beds,
+        under_weight=float(under_weight),
+        asym_shift=asym_shift,
+        asym_shift_by_beds=asym_shift_beds,
         info=dict(
             trained=datetime.date.today().isoformat(),
             data_file=os.path.relpath(data_path, REPO),
@@ -592,6 +649,8 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
             repeated_cv=dict(split=f"{CV_REPEATS} x {N_FOLDS}-fold building-grouped CV on all buildings "
                                    f"with the settings tuned in the test run", results=cv_results),
             blend="equal-weight average of log rent from ridge, svm, knn and gbm",
+            loss=f"asymmetric squared loss on log rent, underestimates x{under_weight:g}; applied as a per-bedroom "
+                 f"shift of the average (tau-expectile of out-of-building residuals)",
             sklearn_version=sklearn.__version__,
             numpy_version=np.__version__,
             train_seconds=round((datetime.datetime.now() - t0).total_seconds()),
@@ -624,6 +683,9 @@ def model_info(model_path=DEFAULT_OUT):
     cv = info["repeated_cv"]["results"]["average"]
     reliability = ("average of ridge, SVM, KNN and gradient boosting; on buildings it had not seen, a typical "
                    "error of about {:.0%} (RMSE ${:,.0f})".format(math.exp(cv["rmse_log"]) - 1, cv["rmse_usd"]))
+    if b.get("under_weight", 1.0) != 1.0:
+        reliability += ("; estimates lean high by about {:+.1%} because underestimates count {:g}x as much as "
+                        "overestimates".format(math.expm1(b["asym_shift"]), b["under_weight"]))
     return {"n_used": info["n_used"], "n_buildings": info["n_buildings"], "trained": info["trained"],
             "reliability": reliability, "amenity_share_yes": dict(spec["amenity_share_yes"])}
 
@@ -638,6 +700,7 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
     floor, property_type ("Apartment" / "Condo") and units_in_listing are optional.
     low/high are the 10th/90th percentile of errors on buildings the model had not seen, for units
     with the same number of bedrooms when there were enough of them.
+    The estimate includes the asymmetric-loss shift (see the module docstring); low/high do not.
     """
     b = load_model(model_path)
     spec = b["spec"]
@@ -705,11 +768,14 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
         warnings.append("not used by this model: " + ", ".join(sorted(unused)))
 
     X = pd.DataFrame([row], columns=spec["features"])
-    est = math.exp(float(b["model"].predict(X)[0])) * b["smearing"]
-    q = b["log_residual_quantiles_by_beds"].get(str(int(round(row["beds"]))),
-                                                b["log_residual_quantiles_out_of_sample"])
-    return {"estimate": round(est), "low": round(est * math.exp(q["p10"])),
-            "high": round(est * math.exp(q["p90"])), "reliability": model_info(model_path)["reliability"],
+    mean_est = math.exp(float(b["model"].predict(X)[0])) * b["smearing"]
+    nbeds = str(int(round(row["beds"])))
+    q = b["log_residual_quantiles_by_beds"].get(nbeds, b["log_residual_quantiles_out_of_sample"])
+    # asymmetric loss: shift the estimate up (models saved before this have no shift)
+    shift = b.get("asym_shift_by_beds", {}).get(nbeds, b.get("asym_shift", 0.0))
+    est = mean_est * math.exp(shift)
+    return {"estimate": round(est), "low": round(mean_est * math.exp(q["p10"])),   # range is not shifted
+            "high": round(mean_est * math.exp(q["p90"])), "reliability": model_info(model_path)["reliability"],
             "warnings": warnings}
 
 
@@ -720,10 +786,15 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT, help="where to save the model (default %(default)s)")
     ap.add_argument("--weights", choices=["building", "unit"], default="building",
                     help="count every building once (default) or every unit once")
+    ap.add_argument("--under-weight", type=float, default=UNDER_WEIGHT,
+                    help="asymmetric loss: cost of an underestimate relative to an overestimate "
+                         "(default %(default)s; 1 = plain mean estimate)")
     ap.add_argument("--predict", action="store_true", help="skip training; load the saved model and run a sample")
     a = ap.parse_args()
     if not a.predict:
-        train(a.data, a.out, a.weights, a.crime_grid)
+        if a.under_weight <= 0:
+            sys.exit("--under-weight must be positive")
+        train(a.data, a.out, a.weights, a.crime_grid, a.under_weight)
     if not os.path.exists(a.out):
         sys.exit(f"no model at {a.out}")
     sample = dict(bedrooms=1, bathrooms=1, sqft=700, zip_code="94107",
