@@ -13,7 +13,7 @@ Usage (from the repo root):
     python Code/edit_training_data.py                      # first: adds the crime columns (needs geopandas)
     python Code/create_model_test.py                       # trains on Data/realty_training_combined_final.csv
     python Code/create_model_test.py --weights unit        # every unit counts once instead of every building
-    python Code/create_model_test.py --under-weight 1.5    # underestimates cost 1.5x overestimates (default 1.25)
+    python Code/create_model_test.py --under-weight 1.5    # underestimates cost 1.5x overestimates (default 2.2)
     python Code/create_model_test.py --data other.csv --out Code/models/other.joblib
     python Code/create_model_test.py --predict             # load the saved model and run a sample prediction
 
@@ -130,7 +130,8 @@ CV_REPEATS = 3
 MIN_BEDS_FOR_OWN_RANGE = 40   # bedroom counts with fewer out-of-fold units use the overall range and shift
 ERROR_BAND_EDGES = [100, 250, 500, 1000]   # $ edges of the error bands (estimate minus actual rent)
 SWEEP_UNDER_WEIGHTS = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6]   # under-weights scored after training (no refit needed)
-UNDER_WEIGHT = 1.25       # asymmetric loss: an underestimate costs this many times an overestimate of the same size
+UNDER_WEIGHT = 2.2        # asymmetric loss: an underestimate costs this many times an overestimate of the same size
+                          # (2.2 puts about a third of held-out estimates below the actual rent; see the sweep)
 
 # Tuning grids (from test_models.ipynb, widened where the best value sat at an edge)
 GRIDS = {
