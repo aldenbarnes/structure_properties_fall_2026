@@ -55,14 +55,18 @@ Scores on the AI rows are reported separately. Without those columns nothing cha
 Asymmetric loss: underestimating rent is worse than overestimating it, so the estimate is judged by
 asymmetric squared loss on log rent (about a percent error): r = log(actual) - log(estimate), loss
 UNDER_WEIGHT * r^2 when r > 0 (an underestimate) and r^2 when r < 0. The four models are still
-tuned and fit for the mean (plain squared loss). The asymmetry is applied afterwards as a shift: the
-out-of-building residuals of the average (step 5) give, per bedroom count, the shift that minimises
-the asymmetric loss (the tau-expectile of the residuals, tau = w / (1 + w)), and predict_rent()
-multiplies the estimate by exp(shift). The low/high range is not shifted: it describes where actual
-rents fall, which the shift does not change. --under-weight 1 gives the plain mean model (shift ~0).
+tuned and fit for the mean (plain squared loss). Two corrections are applied afterwards, both from the
+out-of-building residuals of the average (step 5), kept apart so each can be judged on its own:
+  1. bias correction: per bedroom count, the mean residual, so each bedroom count is unbiased
+     (the blend can run high or low for a bedroom count; this has nothing to do with the loss);
+  2. asymmetry shift: one overall shift that minimises the asymmetric loss of the bias-corrected
+     residuals (their tau-expectile, tau = w / (1 + w)).
+predict_rent() multiplies the estimate by exp(bias correction + shift). The low/high range is not
+shifted: it describes where actual rents fall, which the corrections do not change.
+--under-weight 1 gives asymmetry shift 0 (bias correction only).
 Every score is also reported as root asymmetric loss ("asym"); RMSE gets worse by design when the
-shift is on, so compare versions on asym. The shift is chosen on the same out-of-fold residuals it is
-scored on (one number per bedroom count), so "average + shift" is slightly optimistic.
+shift is on, so compare versions on asym. The corrections are chosen on the same out-of-fold
+residuals they are scored on (a few numbers in all), so the corrected rows are slightly optimistic.
 """
 import argparse
 import datetime
@@ -604,20 +608,32 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
     own_beds = [b for b in np.unique(beds) if (beds == b).sum() / CV_REPEATS >= MIN_BEDS_FOR_OWN_RANGE]
     resid_q_beds = {str(b): q(resid[beds == b]) for b in own_beds}
 
-    # asymmetric loss: per bedroom count, the log shift that minimises it on the out-of-building residuals
-    # (shift is measured from the average's log prediction; the smearing factor is applied on top of both)
-    asym_shift = expectile(resid, under_weight)
-    asym_shift_beds = {str(b): expectile(resid[beds == b], under_weight) for b in own_beds}
-    shift_per_row = np.array([asym_shift_beds.get(str(b), asym_shift) for b in beds])
+    # two corrections from the out-of-building residuals, in log rent on top of the average's prediction
+    # (the smearing factor is applied on top of both):
+    #   1. bias correction per bedroom count: the mean residual, so each bedroom count is unbiased
+    #   2. asymmetry shift: one overall shift that minimises the asymmetric loss of the bias-corrected residuals
+    overall_bias = float(np.mean(resid))
+    bias_beds = {str(b): float(np.mean(resid[beds == b])) for b in own_beds}
+    bias_per_row = np.array([bias_beds.get(str(b), overall_bias) for b in beds])
+    asym_shift = expectile(resid - bias_per_row, under_weight)
     y_base, wb = data["log_rent"].values[base], data["w_building"].values[base]
-    shifted = [_scores(y_base, oof[r, base] + shift_per_row.reshape(CV_REPEATS, -1)[r], wb, under_weight)
+
+    def shifted_scores(shift):
+        per = [_scores(y_base, oof[r, base] + shift.reshape(CV_REPEATS, -1)[r], wb, under_weight)
                for r in range(CV_REPEATS)]
-    cv_results["average_shifted"] = {k: float(np.mean([s[k] for s in shifted])) for k in shifted[0]}
-    s = cv_results["average_shifted"]
-    print(f"  average + shift (under-weight {under_weight:g}; overall {math.expm1(asym_shift):+.1%}, by bedrooms "
-          + ", ".join(f"{b}BR {math.expm1(v):+.1%}" for b, v in asym_shift_beds.items()) + "):")
-    print(f"           {s['rmse_log']:.4f}  (${s['rmse_usd']:,.0f})  by building {s['rmse_log_by_building']:.4f}  "
-          f"asym {s['asym_log']:.4f} (by building {s['asym_log_by_building']:.4f})  [shift chosen on these residuals]")
+        return {k: float(np.mean([p[k] for p in per])) for k in per[0]}
+    cv_results["average_bias_corrected"] = shifted_scores(bias_per_row)
+    cv_results["average_bias_corrected_shifted"] = shifted_scores(bias_per_row + asym_shift)
+    n_beds = {b: int((beds == b).sum() // CV_REPEATS) for b in own_beds}
+    print("  bias correction by bedrooms: " + ", ".join(
+        f"{b}BR {math.expm1(bias_beds[str(b)]):+.1%} ({n_beds[b]} units)" for b in own_beds)
+          + f"; other {math.expm1(overall_bias):+.1%}")
+    print(f"  asymmetry shift (under-weight {under_weight:g}): {math.expm1(asym_shift):+.1%} for every unit")
+    for label, key in (("+ bias corr", "average_bias_corrected"), ("+ bias + asym", "average_bias_corrected_shifted")):
+        s = cv_results[key]
+        print(f"  {label:>13}: {s['rmse_log']:.4f}  (${s['rmse_usd']:,.0f})  by building "
+              f"{s['rmse_log_by_building']:.4f}  asym {s['asym_log']:.4f} (by building "
+              f"{s['asym_log_by_building']:.4f})  [corrections chosen on these residuals]")
 
     # ---- training 2: tuned settings, refit on every building ----
     print("\ntraining 2: refitting all 4 models on all buildings...")
@@ -630,8 +646,9 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
         log_residual_quantiles_out_of_sample=resid_q,
         log_residual_quantiles_by_beds=resid_q_beds,
         under_weight=float(under_weight),
+        bias_correction=overall_bias,
+        bias_correction_by_beds=bias_beds,
         asym_shift=asym_shift,
-        asym_shift_by_beds=asym_shift_beds,
         info=dict(
             trained=datetime.date.today().isoformat(),
             data_file=os.path.relpath(data_path, REPO),
@@ -650,7 +667,8 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
                                    f"with the settings tuned in the test run", results=cv_results),
             blend="equal-weight average of log rent from ridge, svm, knn and gbm",
             loss=f"asymmetric squared loss on log rent, underestimates x{under_weight:g}; applied as a per-bedroom "
-                 f"shift of the average (tau-expectile of out-of-building residuals)",
+                 f"bias correction (mean out-of-building residual) plus one overall shift (tau-expectile of the "
+                 f"bias-corrected residuals)",
             sklearn_version=sklearn.__version__,
             numpy_version=np.__version__,
             train_seconds=round((datetime.datetime.now() - t0).total_seconds()),
@@ -700,7 +718,8 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
     floor, property_type ("Apartment" / "Condo") and units_in_listing are optional.
     low/high are the 10th/90th percentile of errors on buildings the model had not seen, for units
     with the same number of bedrooms when there were enough of them.
-    The estimate includes the asymmetric-loss shift (see the module docstring); low/high do not.
+    The estimate includes the bias correction and asymmetric-loss shift (see the module docstring);
+    low/high do not.
     """
     b = load_model(model_path)
     spec = b["spec"]
@@ -771,8 +790,8 @@ def predict_rent(bedrooms=None, bathrooms=None, sqft=None, zip_code=None, amenit
     mean_est = math.exp(float(b["model"].predict(X)[0])) * b["smearing"]
     nbeds = str(int(round(row["beds"])))
     q = b["log_residual_quantiles_by_beds"].get(nbeds, b["log_residual_quantiles_out_of_sample"])
-    # asymmetric loss: shift the estimate up (models saved before this have no shift)
-    shift = b.get("asym_shift_by_beds", {}).get(nbeds, b.get("asym_shift", 0.0))
+    # per-bedroom bias correction plus the asymmetric-loss shift (models saved before this have neither)
+    shift = b.get("bias_correction_by_beds", {}).get(nbeds, b.get("bias_correction", 0.0)) + b.get("asym_shift", 0.0)
     est = mean_est * math.exp(shift)
     return {"estimate": round(est), "low": round(mean_est * math.exp(q["p10"])),   # range is not shifted
             "high": round(mean_est * math.exp(q["p90"])), "reliability": model_info(model_path)["reliability"],
