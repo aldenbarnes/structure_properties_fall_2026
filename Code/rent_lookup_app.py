@@ -455,7 +455,7 @@ with st.sidebar:
                "Zillow), stopping at the first that finds the building, plus 1 to load apartments.com units. "
                "An apartments.com URL or listing key costs 1. Repeat lookups are cached.")
     st.divider()
-    st.caption("SF model: " + MODEL_INFO["reliability"] + ".")
+    st.caption("SF model: " + MODEL_INFO["reliability"].replace("$", "\\$") + ".")   # "$" pairs render as math
     st.caption("Trained {} on {} units in {} buildings, weighted toward SoMa, Mission Bay and downtown; "
                "read the warnings under each estimate.".format(MODEL_INFO["trained"], MODEL_INFO["n_used"],
                                                                MODEL_INFO["n_buildings"]))
