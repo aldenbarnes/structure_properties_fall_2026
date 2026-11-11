@@ -129,6 +129,7 @@ N_FOLDS = 5
 CV_REPEATS = 3
 MIN_BEDS_FOR_OWN_RANGE = 40   # bedroom counts with fewer out-of-fold units use the overall range and shift
 ERROR_BAND_EDGES = [100, 250, 500, 1000]   # $ edges of the error bands (estimate minus actual rent)
+SWEEP_UNDER_WEIGHTS = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6]   # under-weights scored after training (no refit needed)
 UNDER_WEIGHT = 1.25       # asymmetric loss: an underestimate costs this many times an overestimate of the same size
 
 # Tuning grids (from test_models.ipynb, widened where the best value sat at an edge)
@@ -694,6 +695,23 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
     cv_results["average_corrected"]["error_bands"] = bands_cv
     print(f"\nerror bands, % of units (buildings the model had not seen; 'below' = estimate under the actual rent):")
     _print_error_bands({f"test ({len(te)})": bands_test, "CV, no shift": bands_cv_mean, "CV, final": bands_cv})
+
+    # other under-weights: only the shift changes, so they are scored on the same out-of-fold predictions
+    print("\nunder-weight sweep (repeated CV, % of units; the models are the same, only the shift changes):")
+    print("  weight   shift   underest.  $1,000+ below  within $250  within $500  $1,000+ above")
+    sweep = {}
+    for w in sorted(set(SWEEP_UNDER_WEIGHTS) | {under_weight}):
+        sh = expectile(resid - bias_per_row, w)
+        bd = error_bands(act_cv, np.exp(oof[:, base].ravel() + bias_per_row + sh) * smearing)
+        lab = error_band_labels()
+        under = sum(bd[k] for k in lab if k.endswith("below"))
+        w250 = sum(bd[k] for k in lab[3:7])
+        w500 = sum(bd[k] for k in lab[2:8])
+        sweep[f"{w:g}"] = dict(shift=sh, underestimates=under, within_250=w250, within_500=w500, error_bands=bd)
+        print(f"  {w:>6g}{'*' if w == under_weight else ' '} {math.expm1(sh):+6.1%}   {under:7.1f}%   "
+              f"{bd[lab[0]]:11.1f}%  {w250:10.1f}%  {w500:10.1f}%  {bd[lab[-1]]:12.1f}%")
+    print("  (* = this model)")
+    cv_results["under_weight_sweep"] = sweep
 
     # ---- training 2: tuned settings, refit on every building ----
     print("\ntraining 2: refitting all 4 models on all buildings...")
