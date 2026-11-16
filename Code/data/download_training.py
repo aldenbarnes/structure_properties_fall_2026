@@ -1,10 +1,10 @@
 """Rolling RealtyAPI training download: each run adds the San Francisco buildings not downloaded yet.
 
-    python Code/download_training.py                  # up to 1,000 requests
-    python Code/download_training.py --max-requests 200
-    python Code/download_training.py --dry-run        # search only: how many buildings would be requested
-    python Code/download_training.py --combine-only   # rebuild the combined file, no API calls
-    python Code/download_training.py --reparse        # rebuild every run file from the saved raw responses
+    python Code/data/download_training.py                  # up to 1,000 requests
+    python Code/data/download_training.py --max-requests 200
+    python Code/data/download_training.py --dry-run        # search only: how many buildings would be requested
+    python Code/data/download_training.py --combine-only   # rebuild the combined file, no API calls
+    python Code/data/download_training.py --reparse        # rebuild every run file from the saved raw responses
 
 Set REALTYAPI_KEY (or enter it at the hidden prompt). Standard library only; uses realty_lookup.
 
@@ -36,7 +36,7 @@ Columns
 
 Importing an earlier download (done once for the original file, now
 Data/training/realty_training_2026-10-20.csv):
-    python Code/download_training.py --import path/to/earlier.csv --date YYYY-MM-DD
+    python Code/data/download_training.py --import path/to/earlier.csv --date YYYY-MM-DD
 """
 import argparse
 import csv
@@ -49,9 +49,10 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / d) for d in ("data", "model", "tool")]  # Code/ folders
 import realty_lookup as rl
 
-DATA = Path(__file__).resolve().parent.parent / "Data"
+DATA = Path(__file__).resolve().parents[2] / "Data"
 TRAINING_DIR = DATA / "training"
 QUERIED_PATH = TRAINING_DIR / "queried_listings.csv"
 COMBINED_PATH = DATA / "realty_training_combined.csv"

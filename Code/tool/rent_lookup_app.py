@@ -7,20 +7,23 @@ building amenities) plus adjustments for other features taken from published stu
 
 Run from the repo root:
 
-    pip install -r Code/requirements.txt
-    streamlit run Code/rent_lookup_app.py
+    pip install -r requirements.txt
+    streamlit run Code/tool/rent_lookup_app.py
 
 The RealtyAPI key comes from the REALTYAPI_KEY environment variable, a Streamlit secret
 named REALTYAPI_KEY (.streamlit/secrets.toml, or the app's Secrets settings on Streamlit
 Community Cloud), or the box in the sidebar. Without a key, features can still be typed in.
 """
+import sys
+from pathlib import Path
 import json
 import re
 
 import pandas as pd
 import streamlit as st
 
-import rent_model   # the SF model (Code/models/rent_blend.joblib)
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / d) for d in ("data", "model", "tool")]  # Code/ folders
+import rent_model   # the SF model (Code/model/rent_blend.joblib)
 import ai_audit_log as al
 import feature_adjustments as fa
 import live_check as lc

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 CODE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(CODE))
+sys.path[:0] = [str(CODE / d) for d in ("data", "model", "tool")]
 import ai_audit_log as al          # noqa: E402
 import ai_feedback as fb           # noqa: E402
 import download_training as dt     # noqa: E402

@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_PATH = Path(__file__).resolve().parent.parent / "Data" / "properties.csv"
+DEFAULT_PATH = Path(__file__).resolve().parents[2] / "Data" / "properties.csv"
 NEAR_NUMBERS = 50   # borrow lat/lon from a parcel this close in house number on the same street
 
 # Assessor street-type codes, and what people type for each.
@@ -360,7 +360,7 @@ class ZipGuesser:
 
     @classmethod
     def load(cls, paths=None):
-        data = Path(__file__).resolve().parent.parent / "Data"
+        data = Path(__file__).resolve().parents[2] / "Data"
         paths = paths or [data / "realty_training_combined.csv"]
         points = {}
         for path in paths:

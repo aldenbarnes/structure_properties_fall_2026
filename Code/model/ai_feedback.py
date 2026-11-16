@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Turn recurring AI live-check findings into model adjustments, with evidence gates.
 
-    python Code/ai_feedback.py               # findings report + learned adjustments
-    python Code/ai_feedback.py --compare     # also: would adding the AI rows improve the SF model?
-    python Code/ai_feedback.py --retrain     # also: retrain on base + AI rows and switch to it if it wins
-    python Code/ai_feedback.py --build-view  # only build the training file with the AI rows (below)
-    python Code/ai_feedback.py --build-view --disagreements-only --ai-weight 0.25
+    python Code/model/ai_feedback.py               # findings report + learned adjustments
+    python Code/model/ai_feedback.py --compare     # also: would adding the AI rows improve the SF model?
+    python Code/model/ai_feedback.py --retrain     # also: retrain on base + AI rows and switch to it if it wins
+    python Code/model/ai_feedback.py --build-view  # only build the training file with the AI rows (below)
+    python Code/model/ai_feedback.py --build-view --disagreements-only --ai-weight 0.25
 
 An adjustment needs two independent signals, so neither the AI's opinion alone nor noise in a few
 listings can move prices:
@@ -61,7 +61,7 @@ Which AI rows are used
   - by default comps from Confirmed checks are used too, not only disagreements, so the added
     data is not drawn only from the places the model got wrong (which would push it too far).
 
-    python Code/rent_model.py --data Data/training_views/training_with_ai.csv
+    python Code/model/rent_model.py --data Data/training_views/training_with_ai.csv
 """
 import argparse
 import hashlib
@@ -76,8 +76,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / d) for d in ("data", "model", "tool")]  # Code/ folders
 import ai_audit_log as al            # noqa: E402
 import rent_model as rm       # noqa: E402
 import download_training as dt       # noqa: E402

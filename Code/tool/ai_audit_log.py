@@ -8,13 +8,13 @@ Files (all append-only)
   critique_log.jsonl      one record per live check, whatever the verdict: the subject unit, the
                           model estimate, the live comps the AI read, its explanation and drivers.
   disagreement_log.jsonl  the same record, only for checks the AI did not confirm (Review or
-                          Disagrees). The disagreements that drive Code/ai_feedback.py.
+                          Disagrees). The disagreements that drive Code/model/ai_feedback.py.
   decisions.jsonl         what the person did with a check: kept the model, used the live median,
                           or sent it to an analyst.
   ai_training_rows.csv    every comp unit the AI read and passed the checks, in the same columns
                           as Data/realty_training_combined.csv (parsed by download_training.unit_rows)
                           plus the AI-extracted fields and the source labels below.
-  model_adjustments.jsonl what Code/ai_feedback.py found and did (adjustments, retrain results).
+  model_adjustments.jsonl what Code/model/ai_feedback.py found and did (adjustments, retrain results).
   learned_adjustments.json the adjustments currently in force (read by feature_adjustments.py).
 
 Source labels on every AI training row
@@ -31,6 +31,7 @@ committed to the repository, on its own branch (LOG_BRANCH, created from main if
 commits don't redeploy the app, which watches main. To work with the logs locally:
     git fetch origin ai-audit-logs && git checkout origin/ai-audit-logs -- Data/ai_audit
 """
+import sys
 import base64
 import csv
 import io
@@ -39,9 +40,10 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / d) for d in ("data", "model", "tool")]  # Code/ folders
 import download_training as dt
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[2]
 DATA = REPO / "Data"
 AI_DIR = DATA / "ai_audit"
 CRITIQUE_LOG = AI_DIR / "critique_log.jsonl"
