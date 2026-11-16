@@ -1,6 +1,6 @@
 """SF rent lookup: find an apartment on RealtyAPI, pick the unit, edit any feature, get a rent estimate.
 
-The estimate is the SF model's prediction (create_model_test.py: an average of ridge, SVM, KNN and
+The estimate is the SF model's prediction (rent_model.py: an average of ridge, SVM, KNN and
 gradient boosting fit on SF listings, using size, location, nearby rents, floor, condo vs apartment and
 building amenities) plus adjustments for other features taken from published studies
 (feature_adjustments.py).
@@ -20,7 +20,7 @@ import re
 import pandas as pd
 import streamlit as st
 
-import create_model_test as rent_model   # the SF model (Code/models/rent_blend.joblib)
+import rent_model   # the SF model (Code/models/rent_blend.joblib)
 import ai_audit_log as al
 import feature_adjustments as fa
 import live_check as lc

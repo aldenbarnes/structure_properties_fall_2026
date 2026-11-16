@@ -2,7 +2,7 @@
 
 Everything the AI side produces goes to Data/ai_audit/. This module refuses to write anywhere
 under Data/training/ or to the base training files, so AI output can never end up in them; it
-reaches training only through Code/build_training_view.py, which writes a separate file.
+reaches training only through `ai_feedback.py --build-view`, which writes a separate file.
 
 Files (all append-only)
   critique_log.jsonl      one record per live check, whatever the verdict: the subject unit, the
@@ -53,8 +53,8 @@ LEARNED_ADJUSTMENTS = AI_DIR / "learned_adjustments.json"
 TRAINING_VIEWS = DATA / "training_views"     # generated training files (base + labeled AI rows)
 
 # Never written by the AI side.
-PROTECTED = [DATA / "training", DATA / "realty_training_combined.csv", DATA / "realty_training.csv",
-             DATA / "realty_training_combined_final.csv", DATA / "realty_training_with_extra.csv",
+PROTECTED = [DATA / "training", DATA / "realty_training_combined.csv",
+             DATA / "realty_training_combined_final.csv",
              DATA / "properties.csv", DATA / "crime_grid.csv"]
 
 SOURCE_BASE = "realtyapi_download"

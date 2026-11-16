@@ -1,7 +1,7 @@
 """Rent adjustments for features the SF model does not estimate, using premiums from published studies.
 
-The SF model (create_model_test.py) is fit on SF listings and prices size, location, floor, condo vs
-apartment and the amenities its last training run kept (create_model_test.model_info()). The app
+The SF model (rent_model.py) is fit on SF listings and prices size, location, floor, condo vs
+apartment and the amenities its last training run kept (rent_model.model_info()). The app
 passes those to the model and skips them here (choices["skip"], and no floor). Everything else comes from outside research (see EFFECTS: each entry
 has its sources and a caveat), so these adjustments are assumptions layered on top of the model.
 
@@ -36,7 +36,7 @@ concessions and required fees by zip the same way. Without that file nothing cha
 import csv
 from pathlib import Path
 
-TRAINING_PATH = Path(__file__).resolve().parent.parent / "Data" / "realty_training.csv"
+TRAINING_PATH = Path(__file__).resolve().parent.parent / "Data" / "realty_training_combined.csv"   # every download
 LEARNED_PATH = Path(__file__).resolve().parent.parent / "Data" / "ai_audit" / "learned_adjustments.json"
 
 # ---------- what the user picks ----------
