@@ -27,7 +27,7 @@ Research caveat: the sources were checked against search-engine extracts, not fu
 most are raw listing comparisons or renter surveys rather than size-controlled studies. Values were
 set below the headline figures, and most are low confidence.
 
-AI live-check recalibration: Code/ai_feedback.py may write Data/ai_audit/learned_adjustments.json
+AI live-check recalibration: Code/model/ai_feedback.py may write Data/ai_audit/learned_adjustments.json
 when the AI live check keeps flagging a feature AND the comps it read measure a different premium.
 Those premiums replace the study value here (a blend of the study value and the measured one), and
 the row lists "AI live-check findings" as an added source. market_conditions() gives the typical
@@ -36,8 +36,8 @@ concessions and required fees by zip the same way. Without that file nothing cha
 import csv
 from pathlib import Path
 
-TRAINING_PATH = Path(__file__).resolve().parent.parent / "Data" / "realty_training_combined.csv"   # every download
-LEARNED_PATH = Path(__file__).resolve().parent.parent / "Data" / "ai_audit" / "learned_adjustments.json"
+TRAINING_PATH = Path(__file__).resolve().parents[2] / "Data" / "realty_training_combined.csv"   # every download
+LEARNED_PATH = Path(__file__).resolve().parents[2] / "Data" / "ai_audit" / "learned_adjustments.json"
 
 # ---------- what the user picks ----------
 UNKNOWN = "Unknown"
@@ -261,7 +261,7 @@ EFFECTS = {
 
 
 def load_learned(path=LEARNED_PATH):
-    """Adjustments learned from AI live-check findings (Code/ai_feedback.py), or {} if none."""
+    """Adjustments learned from AI live-check findings (Code/model/ai_feedback.py), or {} if none."""
     import json
     try:
         with open(path, encoding="utf-8") as f:

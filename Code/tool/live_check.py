@@ -30,6 +30,8 @@ What a check does
 The LLM never produces a rent figure or the verdict. Listing text is fenced as untrusted data.
 Cost: up to 1 + MAX_BUILDINGS RealtyAPI requests and 2 Anthropic API calls per check.
 """
+import sys
+from pathlib import Path
 import json
 import math
 import os
@@ -38,6 +40,7 @@ import secrets
 import uuid
 from datetime import date, datetime, timezone
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / d) for d in ("data", "model", "tool")]  # Code/ folders
 import download_training as dt
 import feature_adjustments as fa
 import realty_lookup as rl

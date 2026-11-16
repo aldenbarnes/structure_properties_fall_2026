@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the SF rent model and save it to Code/models/rent_blend.joblib.
+"""Train the SF rent model and save it to Code/model/rent_blend.joblib.
 
 The model is an equal-weight average of four models of log rent: ridge regression, support vector
 regression (RBF kernel), k-nearest neighbors and gradient boosting (HistGradientBoostingRegressor).
@@ -10,12 +10,12 @@ when the file is executed as a script.
 
 Usage (from the repo root):
     pip install pandas numpy scikit-learn joblib
-    python Code/edit_training_data.py                      # first: adds the crime columns (needs geopandas)
-    python Code/rent_model.py                       # trains on Data/realty_training_combined_final.csv
-    python Code/rent_model.py --weights unit        # every unit counts once instead of every building
-    python Code/rent_model.py --under-weight 1.5    # underestimates cost 1.5x overestimates (default 2.2)
-    python Code/rent_model.py --data other.csv --out Code/models/other.joblib
-    python Code/rent_model.py --predict             # load the saved model and run a sample prediction
+    python Code/data/edit_training_data.py                      # first: adds the crime columns (needs geopandas)
+    python Code/model/rent_model.py                       # trains on Data/realty_training_combined_final.csv
+    python Code/model/rent_model.py --weights unit        # every unit counts once instead of every building
+    python Code/model/rent_model.py --under-weight 1.5    # underestimates cost 1.5x overestimates (default 2.2)
+    python Code/model/rent_model.py --data other.csv --out Code/model/other.joblib
+    python Code/model/rent_model.py --predict             # load the saved model and run a sample prediction
 
 What it does (follows test_models.ipynb):
   1. Cleans the unit-level rows with the same filters as the old train_rent_model.py, plus the
@@ -95,10 +95,10 @@ from sklearn.svm import SVR
 sklearn.set_config(enable_metadata_routing=True)   # lets sample weights reach the models that accept them
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
+REPO = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_DATA = os.path.join(REPO, "Data", "realty_training_combined_final.csv")
 DEFAULT_CRIME_GRID = os.path.join(REPO, "Data", "crime_grid.csv")
-DEFAULT_OUT = os.path.join(HERE, "models", "rent_blend.joblib")
+DEFAULT_OUT = os.path.join(HERE, "rent_blend.joblib")
 
 MIN_SQFT = 200            # smaller rows are shared-living rooms / non-standard units
 MAX_BEDS = 4              # larger homes are too few to model
@@ -579,7 +579,7 @@ def train(data_path, out_path, weights="building", crime_grid_path=DEFAULT_CRIME
     missing = [c for c in CRIME_COLS if c not in raw]
     if missing or not os.path.exists(crime_grid_path):
         sys.exit(f"{data_path} has no {', '.join(missing) or 'crime grid'}; "
-                 "run Code/edit_training_data.py first (it writes the crime columns and Data/crime_grid.csv)")
+                 "run Code/data/edit_training_data.py first (it writes the crime columns and Data/crime_grid.csv)")
     d, steps = clean(raw)
     print(f"read {len(raw)} rows from {data_path}")
     for name, n in steps:

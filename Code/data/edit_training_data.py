@@ -16,8 +16,8 @@ about 100 m). The rent model stores the grid so the app can look up crime for an
 geopandas.
 
     pip install pandas numpy geopandas
-    python Code/edit_training_data.py
-    python Code/edit_training_data.py --bandwidth 1500
+    python Code/data/edit_training_data.py
+    python Code/data/edit_training_data.py --bandwidth 1500
 
 How the scores are built
   1. Crime PCA over SF's analysis neighborhoods (Data/crime_neighborhood.csv). Only neighborhoods
@@ -55,7 +55,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-DATA = Path(__file__).resolve().parent.parent / "Data"
+DATA = Path(__file__).resolve().parents[2] / "Data"
 CRIME_PATH = DATA / "crime_neighborhood.csv"
 BOUNDARY_PATH = DATA / "sf_analysis_neighborhoods.geojson"
 BOUNDARY_URL = "https://data.sfgov.org/resource/j2bu-swwd.geojson"
