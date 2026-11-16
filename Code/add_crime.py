@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Add distance-weighted crime scores to the rent training file.
+"""Distance-weighted crime scores (crime_pc1, crime_pc2) for buildings.
 
-Reads Data/realty_training.csv and writes Data/realty_training_with_extra.csv: the same rows and
-columns plus crime_pc1 and crime_pc2.
-
-    pip install pandas numpy geopandas
-    python add_crime.py
-    python add_crime.py --bandwidth 1500 --out ../Data/realty_training_bw1500.csv
+Library used by edit_training_data.py, which adds the scores to the combined training file and
+writes Data/crime_grid.csv. Needs pandas, numpy and geopandas.
 
 How the scores are built
   1. Crime PCA over SF's analysis neighborhoods (Data/crime_neighborhood.csv). Only neighborhoods
@@ -33,7 +29,6 @@ Neighborhood boundaries are DataSF's Analysis Neighborhoods (dataset j2bu-swwd),
 neighborhoods as SFPD's analysis_neighborhood. They are downloaded on the first run and cached in
 Data/sf_analysis_neighborhoods.geojson.
 """
-import argparse
 import sys
 import urllib.request
 from pathlib import Path
@@ -43,10 +38,8 @@ import numpy as np
 import pandas as pd
 
 DATA = Path(__file__).resolve().parent.parent / "Data"
-REALTY_PATH = DATA / "realty_training.csv"
 CRIME_PATH = DATA / "crime_neighborhood.csv"
 BOUNDARY_PATH = DATA / "sf_analysis_neighborhoods.geojson"
-OUT_PATH = DATA / "realty_training_with_extra.csv"
 BOUNDARY_URL = "https://data.sfgov.org/resource/j2bu-swwd.geojson"
 
 METERS_CRS = "EPSG:26910"   # UTM zone 10N, so distances come out in meters
@@ -107,31 +100,3 @@ def building_scores(buildings, boundaries, nh_scores, bandwidth=BANDWIDTH_M):
         scores[f"crime_{pc}"] = (w * nh_scores.loc[dist.columns, pc].values).sum(axis=1).values / w.sum(axis=1).values
     return scores
 
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--realty", type=Path, default=REALTY_PATH)
-    ap.add_argument("--crime", type=Path, default=CRIME_PATH)
-    ap.add_argument("--boundaries", type=Path, default=BOUNDARY_PATH)
-    ap.add_argument("--out", type=Path, default=OUT_PATH)
-    ap.add_argument("--bandwidth", type=float, default=BANDWIDTH_M, help="meters (default %(default)s)")
-    args = ap.parse_args()
-
-    realty = pd.read_csv(args.realty)
-    nh_scores, loadings, explained = crime_pca(pd.read_csv(args.crime))
-    print(f"crime PCA on {len(nh_scores)} neighborhoods, {len(loadings)} categories; "
-          f"variance explained: PC1 {explained[0]:.0%}, PC2 {explained[1]:.0%}")
-    print(loadings.round(2).to_string())
-
-    # Scores depend only on location, so compute once per building and map back to every unit.
-    buildings = realty[["latitude", "longitude"]].drop_duplicates().reset_index(drop=True)
-    scores = building_scores(buildings, load_boundaries(args.boundaries), nh_scores, args.bandwidth)
-    out = realty.merge(buildings.join(scores), on=["latitude", "longitude"], how="left")
-    assert len(out) == len(realty)
-    out.to_csv(args.out, index=False)
-    print(f"wrote {args.out} ({len(out)} rows, {len(buildings)} buildings, bandwidth {args.bandwidth:g} m)")
-    print(out[["crime_pc1", "crime_pc2"]].describe().round(2).to_string())
-
-
-if __name__ == "__main__":
-    main()

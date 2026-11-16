@@ -349,7 +349,7 @@ def same_side(address_text, building):
 
 
 class ZipGuesser:
-    """Zip code for a location, from the nearest listings with known zips (training data and comps).
+    """Zip code for a location, from the nearest listings with known zips (training data).
 
     SF property records have no zip. A zip helps apartments.com resolve an address, and is needed
     for the zip-wide search; a wrong guess near a zip boundary only makes that search less useful.
@@ -361,7 +361,7 @@ class ZipGuesser:
     @classmethod
     def load(cls, paths=None):
         data = Path(__file__).resolve().parent.parent / "Data"
-        paths = paths or [data / "realty_training.csv", data / "RealtyAPI_1010_Anza_Comps.csv"]
+        paths = paths or [data / "realty_training.csv"]
         points = {}
         for path in paths:
             try:

@@ -1,8 +1,5 @@
 # Structure Properties — Fall 2026
 
-### Test Colab
-[![Open test_colab in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/aldenbarnes/structure_properties_fall_2026/blob/main/Code/test_colab.ipynb)
-
 ### SF rent lookup app
 Look up an apartment on RealtyAPI, pick the unit, edit any feature, and get a rent estimate from the SF model in `Code/create_model_test.py` (an average of ridge, SVM, KNN and gradient boosting, saved in `Code/models/rent_blend.joblib`; retrain with `python Code/edit_training_data.py` then `python Code/create_model_test.py`). Underestimates count 2.2x as much as overestimates (squared error on log rent, `--under-weight`), so estimates are shifted up about 5% and about a third of held-out estimates fall below the actual rent; training reports the percent of held-out units whose estimate is $0-100, $100-250, $250-500, $500-1,000 or $1,000+ below or above the actual rent. Start typing an address ("1010 an") and pick from the dropdown of real SF addresses (from `Data/properties.csv`); the city is assumed to be San Francisco. Each address is looked up with up to three RealtyAPI calls (apartments.com address lookup, apartments.com address search, then Zillow for buildings apartments.com doesn't list), stopping at the first that finds the building; a Zillow match fills the form from the property record and shows its Rent Zestimate next to the estimate. Apartments.com listings match by street address (ranges count) or by coordinates on the same side of the street. "How it was looked up" and "RealtyAPI requests this session" show exactly what was tried. Features the model doesn't use (condition, parking, views, pets, utilities, lease term, unit and building amenities) are priced with premiums from published studies in `Code/feature_adjustments.py`, shown line by line under the estimate with their sources.
 
@@ -24,16 +21,10 @@ python Code/download_training.py
 ```
 
 ### Crime features
-`Code/add_crime.py` reads `Data/realty_training.csv` and writes `Data/realty_training_with_extra.csv` with two added columns, `crime_pc1` (overall crime level) and `crime_pc2` (property crime vs. street violence). Both come from a PCA of `Data/crime_neighborhood.csv`, averaged over nearby neighborhoods with closer ones weighted more (see the docstring). The first run downloads DataSF's neighborhood boundaries to `Data/sf_analysis_neighborhoods.geojson`.
+`Code/edit_training_data.py` reads `Data/realty_training_combined.csv` and writes `Data/realty_training_combined_final.csv` (the combined file plus `crime_pc1`, overall crime level, and `crime_pc2`, property crime vs. street violence), plus `Data/crime_grid.csv`, the same scores on a ~100 m grid over SF. Both scores come from a PCA of `Data/crime_neighborhood.csv`, averaged over nearby neighborhoods with closer ones weighted more (the method is in `Code/add_crime.py`'s docstring). The first run downloads DataSF's neighborhood boundaries to `Data/sf_analysis_neighborhoods.geojson`. The rent model trains on the final file and saves the grid, so the app can look up crime for any address without geopandas. Rerun it after each `download_training.py` run, before retraining.
 
 ```
 pip install pandas numpy geopandas
-python Code/add_crime.py
-```
-
-`Code/edit_training_data.py` does the same for `Data/realty_training_combined.csv`, writing `Data/realty_training_combined_final.csv` (the combined file plus `crime_pc1` and `crime_pc2`), plus `Data/crime_grid.csv`, the same scores on a ~100 m grid over SF. The rent model trains on the final file and saves the grid, so the app can look up crime for any address without geopandas. Rerun it after each `download_training.py` run, before retraining.
-
-```
 python Code/edit_training_data.py
 ```
 

@@ -54,7 +54,7 @@ TRAINING_VIEWS = DATA / "training_views"     # generated training files (base + 
 
 # Never written by the AI side.
 PROTECTED = [DATA / "training", DATA / "realty_training_combined.csv", DATA / "realty_training.csv",
-             DATA / "realty_training_combined_final.csv", DATA / "realty_training_with_extra.csv",
+             DATA / "realty_training_combined_final.csv",
              DATA / "properties.csv", DATA / "crime_grid.csv"]
 
 SOURCE_BASE = "realtyapi_download"

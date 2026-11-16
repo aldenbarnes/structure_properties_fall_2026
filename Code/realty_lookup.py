@@ -54,7 +54,7 @@ class APIError(Exception):
 
 
 class Client:
-    """Minimal RealtyAPI client (same request format as realtyapi_notebook.ipynb), with a session cache."""
+    """Minimal RealtyAPI client with a session cache."""
 
     def __init__(self, key, max_requests=MAX_REQUESTS, timeout=60):
         self.key = key
