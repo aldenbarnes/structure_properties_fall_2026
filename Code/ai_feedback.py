@@ -48,7 +48,7 @@ checksum is taken before and after, and the run fails if it changed.
 
 Every row gets
   data_source     "realtyapi_download" (base) or "ai_audit"
-  source_weight   1.0 for base rows, --ai-weight (default 0.5) for AI rows; create_model_test
+  source_weight   1.0 for base rows, --ai-weight (default 0.5) for AI rows; rent_model
                   multiplies its building weights by this, so AI rows count for less
 and AI rows keep all their labels (ai_source_type, ai_check_id, LLM models, prompt version, ...).
 
@@ -61,7 +61,7 @@ Which AI rows are used
   - by default comps from Confirmed checks are used too, not only disagreements, so the added
     data is not drawn only from the places the model got wrong (which would push it too far).
 
-    python Code/create_model_test.py --data Data/training_views/training_with_ai.csv
+    python Code/rent_model.py --data Data/training_views/training_with_ai.csv
 """
 import argparse
 import hashlib
@@ -79,7 +79,7 @@ import pandas as pd
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ai_audit_log as al            # noqa: E402
-import create_model_test as rm       # noqa: E402
+import rent_model as rm       # noqa: E402
 import download_training as dt       # noqa: E402
 import feature_adjustments as fa     # noqa: E402
 

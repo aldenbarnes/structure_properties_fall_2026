@@ -26,7 +26,7 @@ What a run does
      building is refreshed keep their older rows, which recency_weight counts for less.
 
 Columns
-  The same columns as Data/realty_training.csv, plus:
+  The columns of each dated run file in Data/training/, plus:
     date_downloaded      the date the building's details were requested (YYYY-MM-DD).
     days_since_download  days between date_downloaded and the day the combined file was built.
     recency_weight       0.5 ** (days_since_download / --half-life), so a row --half-life days old
@@ -34,8 +34,9 @@ Columns
   The raw responses are kept so a parsing fix can be applied to past runs with --reparse, without
   new requests.
 
-Importing an earlier download (done once for the original file):
-    python Code/download_training.py --import Data/realty_training.csv --date 2026-10-20
+Importing an earlier download (done once for the original file, now
+Data/training/realty_training_2026-10-20.csv):
+    python Code/download_training.py --import path/to/earlier.csv --date YYYY-MM-DD
 """
 import argparse
 import csv

@@ -81,7 +81,7 @@ def test_base_training_data_is_never_writable(audit_dir):
 
 
 def test_logging_leaves_base_files_untouched_and_labels_every_row(audit_dir):
-    import create_model_test as rm
+    import rent_model as rm
     base = [dt.COMBINED_PATH, rm.DEFAULT_DATA] + list(dt.TRAINING_DIR.glob("*.csv"))
     before = {p: sha(p) for p in base}
     chk = run(estimate=4800)
@@ -181,7 +181,7 @@ def test_view_keeps_base_rows_and_labels_ai_rows():
 
 def test_training_weights_and_scores_use_source_labels():
     import pandas as pd
-    import create_model_test as rm
+    import rent_model as rm
     base = pd.read_csv(rm.DEFAULT_DATA).head(200)
     base["data_source"], base["source_weight"] = "realtyapi_download", 1.0
     ai = base.head(20).copy()

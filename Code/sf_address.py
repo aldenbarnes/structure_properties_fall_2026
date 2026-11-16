@@ -361,7 +361,7 @@ class ZipGuesser:
     @classmethod
     def load(cls, paths=None):
         data = Path(__file__).resolve().parent.parent / "Data"
-        paths = paths or [data / "realty_training.csv"]
+        paths = paths or [data / "realty_training_combined.csv"]
         points = {}
         for path in paths:
             try:

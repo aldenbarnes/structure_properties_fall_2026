@@ -11,11 +11,11 @@ when the file is executed as a script.
 Usage (from the repo root):
     pip install pandas numpy scikit-learn joblib
     python Code/edit_training_data.py                      # first: adds the crime columns (needs geopandas)
-    python Code/create_model_test.py                       # trains on Data/realty_training_combined_final.csv
-    python Code/create_model_test.py --weights unit        # every unit counts once instead of every building
-    python Code/create_model_test.py --under-weight 1.5    # underestimates cost 1.5x overestimates (default 2.2)
-    python Code/create_model_test.py --data other.csv --out Code/models/other.joblib
-    python Code/create_model_test.py --predict             # load the saved model and run a sample prediction
+    python Code/rent_model.py                       # trains on Data/realty_training_combined_final.csv
+    python Code/rent_model.py --weights unit        # every unit counts once instead of every building
+    python Code/rent_model.py --under-weight 1.5    # underestimates cost 1.5x overestimates (default 2.2)
+    python Code/rent_model.py --data other.csv --out Code/models/other.joblib
+    python Code/rent_model.py --predict             # load the saved model and run a sample prediction
 
 What it does (follows test_models.ipynb):
   1. Cleans the unit-level rows with the same filters as the old train_rent_model.py, plus the
@@ -912,8 +912,8 @@ def main():
 
 
 if __name__ == "__main__":
-    # Run through the imported module so the saved model refers to create_model_test.CoreWeight
+    # Run through the imported module so the saved model refers to rent_model.CoreWeight
     # (not __main__.CoreWeight); otherwise other code could not load it.
     sys.path.insert(0, HERE)
-    import create_model_test
-    create_model_test.main()
+    import rent_model
+    rent_model.main()
