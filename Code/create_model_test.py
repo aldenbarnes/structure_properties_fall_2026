@@ -46,7 +46,7 @@ RMSE is reported both per unit and per building (weighted).
 
 Rerun it whenever new data arrives; the previous model stays in git history.
 
-AI live-check rows (optional): a file from build_training_view.py has a data_source column
+AI live-check rows (optional): a file from ai_feedback.py --build-view has a data_source column
 ("realtyapi_download" or "ai_audit") and a source_weight column. Building weights are multiplied by
 source_weight, so AI rows count for less, and every reported score (test set and repeated CV) is
 computed on the original rows only, so they stay comparable with a model trained without AI rows.
@@ -121,7 +121,7 @@ LOCATION_COLS = ["x_km", "y_km"]
 NEARBY_COLS = ["nearby_ppsf", "nearby_dist_km"]        # added inside each fit by NearbyRents
 EXTRA_COLS = ["sqft_per_bed", "floor", "floor_known", "condo", "ptype_unknown",
               "log_units_in_listing", "is_floor_plan"]
-AI_SOURCE = "ai_audit"    # data_source of rows added by the AI live check (build_training_view.py)
+AI_SOURCE = "ai_audit"    # data_source of rows added by the AI live check (ai_feedback.py --build-view)
 CRIME_COLS = ["crime_pc1", "crime_pc2"]                # from edit_training_data.py
 TEST_FRACTION = 0.20
 SPLIT_SEED = 2026
@@ -287,7 +287,7 @@ def clean(df):
     d = d.reset_index(drop=True)
     w = 1.0 / d.groupby("listing_key")["rent"].transform("size")
     d["w_building"] = w / w.groupby(d["listing_key"]).transform("sum")   # every building sums to 1
-    if "source_weight" in d:   # AI live-check rows count for less (build_training_view.py)
+    if "source_weight" in d:   # AI live-check rows count for less (ai_feedback.py --build-view)
         d["w_building"] *= pd.to_numeric(d["source_weight"], errors="coerce").fillna(1.0)
     return d, steps
 

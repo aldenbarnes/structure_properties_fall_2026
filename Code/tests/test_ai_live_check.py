@@ -19,7 +19,6 @@ CODE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE))
 import ai_audit_log as al          # noqa: E402
 import ai_feedback as fb           # noqa: E402
-import build_training_view as btv  # noqa: E402
 import download_training as dt     # noqa: E402
 import feature_adjustments as fa   # noqa: E402
 import live_check as lc            # noqa: E402
@@ -170,13 +169,13 @@ def test_view_keeps_base_rows_and_labels_ai_rows():
           _ai_row("n2", "u2", comp="Low"),
           _ai_row("n3", "u3", src="ai_confirmation"),
           _ai_row("n4", "u4", when="2026-01-01T00:00:00+00:00")]
-    rows, counts = btv.build_rows(base, ai, ai_weight=0.5, today=NOW.date())
+    rows, counts = fb.build_rows(base, ai, ai_weight=0.5, today=NOW.date())
     by = {(r["listing_key"], r["unit_key"]): r for r in rows}
     assert by[("b1", "u1")]["data_source"] == "realtyapi_download" and by[("b1", "u1")]["rent"] == "3000"
     assert by[("n1", "u9")]["ai_checked_at"].startswith("2026-11-01") and by[("n1", "u9")]["source_weight"] == 0.5
     assert ("n2", "u2") not in by and ("n4", "u4") not in by and ("n3", "u3") in by
     assert counts["ai_skipped_unit_in_base_data"] == 1 and counts["ai_skipped_older_duplicate"] == 1
-    rows2, _ = btv.build_rows(base, ai, include_confirmed=False, today=NOW.date())
+    rows2, _ = fb.build_rows(base, ai, include_confirmed=False, today=NOW.date())
     assert ("n3", "u3") not in {(r["listing_key"], r["unit_key"]) for r in rows2}
 
 

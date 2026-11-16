@@ -2,7 +2,7 @@
 
 Everything the AI side produces goes to Data/ai_audit/. This module refuses to write anywhere
 under Data/training/ or to the base training files, so AI output can never end up in them; it
-reaches training only through Code/build_training_view.py, which writes a separate file.
+reaches training only through `ai_feedback.py --build-view`, which writes a separate file.
 
 Files (all append-only)
   critique_log.jsonl      one record per live check, whatever the verdict: the subject unit, the

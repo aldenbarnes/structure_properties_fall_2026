@@ -21,7 +21,7 @@ python Code/download_training.py
 ```
 
 ### Crime features
-`Code/edit_training_data.py` reads `Data/realty_training_combined.csv` and writes `Data/realty_training_combined_final.csv` (the combined file plus `crime_pc1`, overall crime level, and `crime_pc2`, property crime vs. street violence), plus `Data/crime_grid.csv`, the same scores on a ~100 m grid over SF. Both scores come from a PCA of `Data/crime_neighborhood.csv`, averaged over nearby neighborhoods with closer ones weighted more (the method is in `Code/add_crime.py`'s docstring). The first run downloads DataSF's neighborhood boundaries to `Data/sf_analysis_neighborhoods.geojson`. The rent model trains on the final file and saves the grid, so the app can look up crime for any address without geopandas. Rerun it after each `download_training.py` run, before retraining.
+`Code/edit_training_data.py` reads `Data/realty_training_combined.csv` and writes `Data/realty_training_combined_final.csv` (the combined file plus `crime_pc1`, overall crime level, and `crime_pc2`, property crime vs. street violence), plus `Data/crime_grid.csv`, the same scores on a ~100 m grid over SF. Both scores come from a PCA of `Data/crime_neighborhood.csv`, averaged over nearby neighborhoods with closer ones weighted more (the method is in the file's docstring). The first run downloads DataSF's neighborhood boundaries to `Data/sf_analysis_neighborhoods.geojson`. The rent model trains on the final file and saves the grid, so the app can look up crime for any address without geopandas. Rerun it after each `download_training.py` run, before retraining.
 
 ```
 pip install pandas numpy geopandas
@@ -35,10 +35,10 @@ Add `ANTHROPIC_API_KEY` next to `REALTYAPI_KEY` in `.streamlit/secrets.toml` (or
 
 **Logs, kept apart from the training data.** Everything goes to `Data/ai_audit/` (`Code/ai_audit_log.py`, which refuses to write to `Data/training/`, the base CSVs or the crime grid): `critique_log.jsonl` (every check), `disagreement_log.jsonl` (Review and Disagrees only), `decisions.jsonl` (keep the estimate / use the live median / send to an analyst) and `ai_training_rows.csv` (every comp the AI read, in the same columns as the training data plus the AI-read fields and source labels: `data_source=ai_audit`, `ai_source_type` = `ai_disagreement` / `ai_confirmation` / `ai_insufficient_evidence`, the check ID, the AI models and the prompt version).
 
-**Training with the AI rows** (`Code/build_training_view.py`) writes a separate file, `Data/training_views/training_with_ai.csv`: the rows of `realty_training_combined_final.csv` labeled `realtyapi_download`, plus AI rows for units the downloads don't have, at half weight, with crime scores looked up from `Data/crime_grid.csv`. `create_model_test.py` reads the labels: AI rows count for `source_weight`, and every score it reports is on original rows only.
+**Training with the AI rows** (`python Code/ai_feedback.py --build-view`) writes a separate file, `Data/training_views/training_with_ai.csv`: the rows of `realty_training_combined_final.csv` labeled `realtyapi_download`, plus AI rows for units the downloads don't have, at half weight, with crime scores looked up from `Data/crime_grid.csv`. `create_model_test.py` reads the labels: AI rows count for `source_weight`, and every score it reports is on original rows only.
 
 ```
-python Code/build_training_view.py
+python Code/ai_feedback.py --build-view
 python Code/create_model_test.py --data Data/training_views/training_with_ai.csv --out Code/models/test_with_ai.joblib
 ```
 
